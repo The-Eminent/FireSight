@@ -1,9 +1,16 @@
 import unittest
 
 import numpy as np
+from shapely.geometry import Polygon
 
-from inference_api import LiveWeather, PredictionService, specific_humidity, utm_crs
-from train_hurdle import FEATURE_COLUMNS
+from inference_api import (
+    INFERENCE_FEATURE_COLUMNS,
+    LiveWeather,
+    PredictionService,
+    _live_geometry_features,
+    specific_humidity,
+    utm_crs,
+)
 
 
 class FakeEnvironment:
@@ -15,8 +22,11 @@ class FakeEnvironment:
 
 
 class FakeClassifier:
+    features = None
+
     def predict_proba(self, features):
-        assert tuple(features.columns) == FEATURE_COLUMNS
+        assert tuple(features.columns) == INFERENCE_FEATURE_COLUMNS
+        self.features = features.copy()
         return np.tile([0.2, 0.8], (len(features), 1))
 
 
@@ -28,8 +38,8 @@ class FakeRegressor:
 class InferenceServiceTest(unittest.TestCase):
     def setUp(self):
         metadata = {
-            "run_id": "fixture", "feature_set_version": "boundary_physics_v1",
-            "features": list(FEATURE_COLUMNS), "classifier_threshold": 0.5,
+            "run_id": "fixture", "feature_set_version": "boundary_physics_v2",
+            "features": list(INFERENCE_FEATURE_COLUMNS), "classifier_threshold": 0.5,
             "runtime_defaults": {
                 name: {"value": value, "source": "train_median"}
                 for name, value in {
@@ -37,8 +47,9 @@ class InferenceServiceTest(unittest.TestCase):
                 }.items()
             },
         }
+        self.classifier = FakeClassifier()
         self.service = PredictionService(
-            FakeClassifier(), FakeRegressor(), metadata, FakeEnvironment()
+            self.classifier, FakeRegressor(), metadata, FakeEnvironment()
         )
 
     def test_predicts_valid_geojson_with_metric_projection(self):
@@ -58,6 +69,21 @@ class InferenceServiceTest(unittest.TestCase):
         self.assertEqual(result["properties"]["utm_epsg"], 32610)
         self.assertLessEqual(result["properties"]["max_displacement_m"], 10_000.0)
         self.assertEqual(len(result["properties"]["fallback_features"]), 4)
+        self.assertEqual(self.classifier.features.shape, (4, 19))
+        self.assertTrue(
+            self.classifier.features["wind_alignment_cosine"].between(-1.0, 1.0).all()
+        )
+        self.assertTrue(
+            self.classifier.features["neighboring_fire_pixels"].between(0.0, 48.0).all()
+        )
+        expected = (
+            self.classifier.features["wind_alignment_cosine"]
+            * self.classifier.features["vs"]
+            * result["properties"]["terrain_slope"]
+        )
+        np.testing.assert_allclose(
+            self.classifier.features["slope_wind_interaction"], expected
+        )
 
     def test_rejects_non_polygon_geometry(self):
         feature = {
@@ -70,6 +96,18 @@ class InferenceServiceTest(unittest.TestCase):
     def test_specific_humidity_and_utm_are_physical(self):
         self.assertTrue(0.0 < specific_humidity(25.0, 30.0, 900.0) < 0.03)
         self.assertEqual(utm_crs(-120.0, 37.0).to_epsg(), 32611)
+
+    def test_polygon_normals_are_outward_for_either_ring_orientation(self):
+        ring = [(0.0, 0.0), (1_000.0, 0.0), (1_000.0, 1_000.0), (0.0, 1_000.0)]
+        forward, _ = _live_geometry_features(Polygon(ring), [ring], [False], 270.0)
+        reversed_ring = list(reversed(ring))
+        reverse, _ = _live_geometry_features(
+            Polygon(reversed_ring), [reversed_ring], [False], 270.0
+        )
+
+        np.testing.assert_allclose(sorted(forward), sorted(reverse), atol=1e-9)
+        self.assertEqual(sum(forward > 0.0), 2)
+        self.assertEqual(sum(forward < 0.0), 2)
 
 
 if __name__ == "__main__":

@@ -14,6 +14,7 @@ import sklearn
 import xgboost
 from sklearn.metrics import (
     accuracy_score,
+    average_precision_score,
     mean_absolute_error,
     mean_squared_error,
     precision_recall_fscore_support,
@@ -22,23 +23,25 @@ from sklearn.metrics import (
 from xgboost import XGBClassifier, XGBRegressor
 
 
-FEATURE_SET_VERSION = "boundary_physics_v1"
+FEATURE_SET_VERSION = "boundary_physics_v2"
 RAW_COLUMNS = (
     "elevation", "th", "vs", "tmmn", "tmmx", "sph", "pr", "pdsi",
     "NDVI", "population", "erc", "physics_ros_m_min",
-    "physics_heading_deg", "physics_baseline_distance_m", "spreads",
-    "residual_distance_m",
+    "physics_heading_deg", "physics_baseline_distance_m",
+    "wind_alignment_cosine", "neighboring_fire_pixels",
+    "slope_wind_interaction", "spreads", "residual_distance_m",
 )
 FEATURE_COLUMNS = (
     "elevation", "vs", "wind_from_sin", "wind_from_cos", "tmmn", "tmmx",
     "sph", "pr", "pdsi", "NDVI", "population", "erc",
     "physics_ros_m_min", "physics_heading_sin", "physics_heading_cos",
-    "physics_baseline_distance_m",
+    "physics_baseline_distance_m", "wind_alignment_cosine",
+    "neighboring_fire_pixels", "slope_wind_interaction",
 )
 CLASSIFIER_PARAMS = {
     "n_estimators": 500, "max_depth": 6, "learning_rate": 0.05,
     "subsample": 0.8, "colsample_bytree": 0.8, "min_child_weight": 5,
-    "reg_lambda": 1.0, "objective": "binary:logistic", "eval_metric": "logloss",
+    "reg_lambda": 1.0, "objective": "binary:logistic", "eval_metric": "aucpr",
     "tree_method": "hist", "random_state": 42, "n_jobs": -1,
 }
 REGRESSOR_PARAMS = {
@@ -71,6 +74,9 @@ def build_features(frame: pd.DataFrame) -> pd.DataFrame:
         "physics_heading_sin": np.sin(heading_radians),
         "physics_heading_cos": np.cos(heading_radians),
         "physics_baseline_distance_m": frame["physics_baseline_distance_m"],
+        "wind_alignment_cosine": frame["wind_alignment_cosine"],
+        "neighboring_fire_pixels": frame["neighboring_fire_pixels"],
+        "slope_wind_interaction": frame["slope_wind_interaction"],
     }
     return pd.DataFrame(values, columns=FEATURE_COLUMNS, dtype=np.float32)
 
@@ -83,6 +89,7 @@ def classifier_metrics(y_true: pd.Series, probabilities: np.ndarray) -> dict[str
     return {
         "precision": float(precision), "recall": float(recall), "f1": float(f1),
         "accuracy": float(accuracy_score(y_true, predictions)),
+        "pr_auc": float(average_precision_score(y_true, probabilities)),
         "roc_auc": float(roc_auc_score(y_true, probabilities)),
     }
 
@@ -147,7 +154,7 @@ def main() -> None:
     }
 
     timestamp = datetime.now(timezone.utc)
-    run_id = timestamp.strftime("%Y%m%dT%H%M%SZ") + "_hurdle_v1"
+    run_id = timestamp.strftime("%Y%m%dT%H%M%SZ") + "_hurdle_v2"
     args.model_dir.mkdir(parents=True, exist_ok=True)
     classifier_path = args.model_dir / f"{run_id}_classifier.json"
     regressor_path = args.model_dir / f"{run_id}_regressor.json"

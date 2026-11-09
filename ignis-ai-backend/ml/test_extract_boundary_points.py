@@ -10,14 +10,17 @@ import tensorflow as tf
 from extract_boundary_points import ENVIRONMENT_FEATURES, extract_example, extract_files
 
 
-def make_example(current, future, wind_from=270.0, wind_speed=3.0):
+def make_example(current, future, wind_from=270.0, wind_speed=3.0, overrides=None):
+    overrides = overrides or {}
     features = {
         "PrevFireMask": tf.train.Feature(float_list=tf.train.FloatList(value=current.ravel())),
         "FireMask": tf.train.Feature(float_list=tf.train.FloatList(value=future.ravel())),
     }
     for index, name in enumerate(ENVIRONMENT_FEATURES):
         value = wind_from if name == "th" else wind_speed if name == "vs" else index + 0.5
-        values = np.full(current.size, value, dtype=np.float32)
+        values = np.asarray(
+            overrides.get(name, np.full(current.shape, value)), dtype=np.float32
+        ).ravel()
         features[name] = tf.train.Feature(float_list=tf.train.FloatList(value=values))
     return tf.train.Example(features=tf.train.Features(feature=features))
 
@@ -54,6 +57,25 @@ class BoundaryPointExtractionTest(unittest.TestCase):
         self.assertEqual(len(rows), 8)
         self.assertTrue(all(row["spreads"] == 0 for row in rows))
         self.assertTrue(all(row["actual_distance_m"] == 0 for row in rows))
+
+    def test_engineers_boundary_alignment_density_and_slope_interaction(self):
+        current = np.zeros((5, 5), dtype=np.float32)
+        current[1:4, 1:4] = 1
+        elevation = np.tile(np.arange(5, dtype=np.float32) * 1_000.0, (5, 1))
+        rows = extract_example(
+            make_example(current, current, overrides={"elevation": elevation}),
+            "train:0:0", "train", "fixture", 0,
+        )
+        east_edge = next(row for row in rows if row["row"] == 2 and row["column"] == 3)
+        west_edge = next(row for row in rows if row["row"] == 2 and row["column"] == 1)
+
+        self.assertAlmostEqual(east_edge["wind_alignment_cosine"], 1.0)
+        self.assertAlmostEqual(west_edge["wind_alignment_cosine"], -1.0)
+        self.assertEqual(east_edge["neighboring_fire_pixels"], 8.0)
+        self.assertAlmostEqual(east_edge["slope_wind_interaction"], 3.0)
+        self.assertTrue(all(
+            -1.0 <= row["wind_alignment_cosine"] <= 1.0 for row in rows
+        ))
 
     def test_rejects_distant_front_in_same_chip(self):
         current = np.zeros((64, 64), dtype=np.float32)
@@ -94,6 +116,8 @@ class BoundaryPointExtractionTest(unittest.TestCase):
             self.assertEqual(len(rows), 1)
             self.assertEqual(manifest["rows_written"], 1)
             self.assertEqual(manifest["feature_records_present"]["pr"], 1)
+            self.assertIn("wind_alignment_cosine", stored_manifest["columns"])
+            self.assertIn("engineered_features", stored_manifest)
             self.assertFalse(stored_manifest["incident_ids_available"])
 
 

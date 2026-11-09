@@ -1,405 +1,224 @@
-# Ignis AI - Complete Setup & Run Guide
+# FireSight
 
-[▶️ DEMO VIDEO](https://www.awesomescreenshot.com/video/39450246?key=5a62c83e79661779a9495f62051fc3ac)
+FireSight is a wildfire detection and 24-hour spread-prediction capstone. It
+combines recent satellite thermal observations with official US incident data,
+shows consolidated events on a Mapbox map, builds a current fire boundary on
+demand, and sends that boundary through a physics-informed XGBoost model.
 
-## Live Demo
+> FireSight is a research prototype. Its detections and predictions are not
+> emergency guidance and must not replace official agency information.
 
-You can try out IgnisAI’s live deployment here:  
-**[https://ignis-ai-frontend.onrender.com/](https://ignis-ai-frontend.onrender.com/)**
+## What it does
 
----
+- Ingests NASA FIRMS NOAA-20 and NOAA-21 VIIRS observations.
+- Deduplicates observations and filters curated industrial heat sources.
+- Enriches observations with urban-area context without automatically calling
+  urban heat a structural fire.
+- Matches satellite observations to NIFC/WFIGS incidents using acreage-scaled
+  geospatial search radii.
+- Groups unmatched observations with 1.5 km/minimum-3 DBSCAN clustering.
+- Distinguishes confirmed wildfires, satellite-detected fires, unverified
+  thermal anomalies, and official reports without recent satellite detection.
+- Displays saved WFIGS perimeters when available; otherwise it can construct an
+  estimated footprint from the satellite cluster.
+- Predicts a 24-hour boundary using Fuel Model 4 Rothermel physics plus an
+  XGBoost classifier/regressor hurdle model.
 
-### Please Note
+## Architecture
 
-- **Render Free Tier “Sleep”**  
-  The backend is hosted on Render’s free plan, which means it will automatically go to sleep after about 15 minutes of inactivity.  
-  On your first visit (or after a period of no use), you may experience a short delay (10–30 seconds) while the service “wakes up.”  
+```text
+NASA FIRMS + NIFC/WFIGS
+          |
+          v
+scheduled Express ingestion worker
+          |
+          v
+MongoDB GeoJSON + 2dsphere indexes
+          |
+          v
+React/Mapbox event map
+          |
+          +--> current official/estimated boundary
+          |
+          +--> Express prediction proxy --> FastAPI --> XGBoost + Open-Meteo
+                                                    --> predicted GeoJSON
+```
 
-- **Prediction Latency**  
-  When you click **“Predict Fire Spread”**, the Python/ML service needs a moment to run the model and return results.  
-  Please be patient- once it finishes processing, the predicted spread visualization and data will appear automatically.
+| Layer | Technology |
+|---|---|
+| Frontend | React 19, Mapbox GL JS, Axios |
+| Public API | Node.js, Express, Mongoose |
+| Database | MongoDB with native GeoJSON and `2dsphere` indexes |
+| Geospatial/ML | Python 3.11, Shapely, PyProj, scikit-learn, XGBoost |
+| Inference | FastAPI/Uvicorn with models loaded once at startup |
 
-And now! This guide will walk you through setting up Ignis AI from scratch on a fresh machine.
+## Repository layout
 
-This README ensures you can spin up both services locally, on **macOS**, **Linux**, or **Windows (VSCode)**, without surprises.
+```text
+ignis-ai-frontend/          React map, controls, perimeter and prediction UI
+ignis-ai-backend/
+  models/                   MongoDB/Mongoose schemas
+  routes/                   Public Express endpoints
+  services/                 Ingestion, matching, clustering and persistence
+  scripts/                  Database migration and reference-data utilities
+  ml/                       Geometry, training and FastAPI inference code
+    models/                 Versioned XGBoost JSON runtime artifacts
+    experiments/runs.csv    Held-out model metrics
+```
 
----
+Raw TFRecords and generated training CSVs are intentionally excluded from Git.
+The small runtime XGBoost artifacts under `ml/models/` are included.
+
 ## Prerequisites
 
-1. **Git**
-2. **Node.js** LTS **v16.x–v18.x** & **npm** (v8+)
-   ```bash
-   node --version   # expect v16.x or v18.x
-   npm --version
-   ```
-3. **Python 3.11+**
-   ```bash
-   python --version # expect 3.11.x
-   ```
-4. **MongoDB** (local or Atlas)
+- Node.js 18+ and npm
+- Python 3.11
+- MongoDB locally or through Atlas
+- A NASA FIRMS API key
+- A public Mapbox token beginning with `pk.`
+- macOS: Homebrew `libomp` is required by XGBoost (`brew install libomp`)
 
----
-Before you begin, make sure you have these installed on your machine:
+## Local setup
 
-1. **Git**
-   - macOS/Linux: usually pre-installed. If not, install via your package manager (e.g. `brew install git`).
-   - Windows: download & install from https://git-scm.com/downloads.
-
-2. **Node.js & npm**
-   - Download the **LTS** installer from https://nodejs.org and follow the prompts.
-   - Verify:
-     ```bash
-     node --version   # expect v16.x or v18.x LTS
-     npm --version    # expect v8.x+
-     ```
-
-3. **Python 3.11+**
-   - Download from https://www.python.org/downloads/ and install (ensure "Add to PATH" on Windows).
-   - Verify:
-     ```bash
-     python --version # expect 3.11.x
-     ```
-
-4. **MongoDB Community Server** (for local development)
-   - **macOS (Homebrew)**:
-     ```bash
-     brew tap mongodb/brew
-     brew install mongodb-community@6.0
-     brew services start mongodb-community@6.0
-     ```
-   - **Windows**:
-     - Download the MSI installer from https://www.mongodb.com/try/download/community and install as a service.
-   - **Linux (Ubuntu/Debian)**:
-     ```bash
-     sudo apt update
-     sudo apt install -y mongodb
-     sudo systemctl enable --now mongodb
-     ```
-   - Verify:
-     ```bash
-     mongo --eval "db.runCommand({ connectionStatus: 1 })"
-     ```
-
-5. **MongoDB Compass** (optional)
-   - GUI for MongoDB: download from https://www.mongodb.com/products/compass if you prefer a visual database explorer.
-
----
-
-## 1. Clone the Repo
+Clone the repository:
 
 ```bash
-# Any terminal (macOS, Linux, Windows PowerShell or VSCode)
-git clone https://github.com/your-org/ignis-ai.git
-cd ignis-ai
-```  
-You should have:
-```
-ignis-ai-backend/
-ignis-ai-frontend/
+git clone https://github.com/The-Eminent/FireSight.git
+cd FireSight
 ```
 
----
-## 2. Backend & ML Setup
-
-### 2.1 Install Backend Dependencies (Node)
+Install backend and Python dependencies:
 
 ```bash
 cd ignis-ai-backend
 npm install
-```  
-> **Same** on macOS, Linux, or VSCode terminal in Windows.
-
-### 2.2 **Create & Configure `.env`**
-
-We default to `PORT=5000`, but on macOS, port 5000 is often in use, so you can change it to `5001`.
-
-### **Create .env File**
-
-**macOS/Linux:**
-```bash
-cd ignis-ai-backend
-touch .env
+python3.11 -m venv ml/venv
+ml/venv/bin/pip install -r ml/requirements-detection.txt \
+  -r ml/requirements-inference.txt
+cp .env.example .env
 ```
 
-**Windows (PowerShell):**
-```powershell
-cd ignis-ai-backend
-New-Item .env -ItemType File
-```
+Edit `ignis-ai-backend/.env`:
 
-### **Edit .env File**
-
-Open `.env` in your code editor and add the following lines:
-
-```
-# On macOS, default to 5001 due to 5000 often being in use
+```dotenv
 PORT=5001
-MONGODB_URI=<your MongoDB URI>
-NASA_API_KEY=<your NASA FIRMS API key>
-MAPBOX_ACCESS_TOKEN=<your Mapbox secret token>
+PREDICTION_SERVICE_URL=http://127.0.0.1:8000
+MONGODB_URI=mongodb://localhost:27017/ignis_ai
+NASA_API_KEY=your_firms_key
+MAPBOX_ACCESS_TOKEN=<your-public-mapbox-token>
+PYTHON_COMMAND=./ml/venv/bin/python
 ```
 
-### 2.3 Python Virtual Environment & ML Dependencies
-
-Navigate into the ML folder and create a venv:
-
-#### macOS / Linux
-```bash
-cd ml
-python3 -m venv venv              # create a virtual environment
-source venv/bin/activate          # activate venv
-pip install tensorflow scikit-learn pandas numpy joblib tqdm requests   # install all required Python packages
-# Once you're done working in this environment, run:
-deactivate                         # exit the virtual environment
-```
-
-#### Windows (PowerShell / VSCode)
-```powershell
-cd ml
-python -m venv venv               # create a virtual environment
-.env\Scripts\Activate.ps1    # activate venv
-pip install tensorflow scikit-learn pandas numpy joblib tqdm requests
-# Once you're done, run:
-deactivate                         # exit the virtual environment
-```
-
-Note: **`deactivate`** simply returns your shell to its original state; only use it when you want to stop using the venv.
-
-### 2.4 Pre‑trained Model Files
-
-Copy (or confirm) these into `ignis-ai-backend/ml/`:
-```
-wildfire_spread_classifier_advanced.joblib
-wildfire_spread_regressor_advanced.joblib
-```
-We **do not** commit the large TFRecord training files.
-
-### 2.5 Start the Backend Server
-
-Make sure the Python path used in `predictfirespread.js` is aligned with your venv location (e.g., `./ml/venv/bin/python` or `./ml/venv/Scripts/python.exe`).
-
-Then run:
-```bash
-npm start
-```  
-Verify you see:
-```
-Server started on port 5001
-MongoDB connected successfully
-```
-
----
-## 3. Frontend Setup (React + Mapbox)
-
-Open a **new** terminal/tab:
+Install and configure the frontend:
 
 ```bash
-cd ignis-ai-frontend
+cd ../ignis-ai-frontend
 npm install
-touch .env  # or create manually on Windows
-```  
-In `.env`, set:
-```ini
-REACT_APP_MAPBOX_TOKEN=<your Mapbox public token>
+```
+
+Create `ignis-ai-frontend/.env`:
+
+```dotenv
+REACT_APP_MAPBOX_TOKEN=<your-public-mapbox-token>
 REACT_APP_API_BASE_URL=http://localhost:5001/api
 ```
 
-Also ensure `api.js` reflects the same port (5001):
-```javascript
-const API_BASE_URL = process.env.REACT_APP_API_BASE_URL || "http://localhost:5001/api";
-```
+Never put a Mapbox secret token beginning with `sk.` in frontend code. Both
+local `.env` files are ignored by Git.
 
-Then launch:
+Initialize MongoDB indexes from `ignis-ai-backend/`:
+
 ```bash
+npm run db:migrate-geo
+```
+
+Optional maintenance commands:
+
+```bash
+npm run db:sync-spatial
+ml/venv/bin/python seed_industry.py
+npm run data:refresh
+```
+
+## Run locally
+
+Start all three development services from the repository root:
+
+```bash
+npm run dev
+```
+
+Press `Ctrl+C` once to stop FastAPI, Express and React together. To run the
+services separately for debugging, use the individual commands below.
+
+```bash
+# Terminal 1 — ignis-ai-backend/
+ml/venv/bin/uvicorn inference_api:app --app-dir ml \
+  --host 127.0.0.1 --port 8000
+
+# Terminal 2 — ignis-ai-backend/
 npm start
-```  
-App runs at **http://localhost:3000** (API calls proxy to `http://localhost:5001/api`).
 
----
-## 4. (Optional) Retrain ML Models
-
-If you want to retrain on Kaggle’s TFRecords:
-
-1. Place TFRecords under `ignis-ai-backend/ml/data/`
-2. Activate your Python venv (see 2.2)
-3. Run:
-   ```bash
-   python process_data_dual.py       # extract features
-   python train_classifier_advanced.py  # train classifier
-   python train_regressor_advanced.py   # train regressor
-   ```  
-4. New `*.joblib` files will replace the ones in `ml/`.
-
----
-## 5. Verify Everything Works
-
-- **Backend API**: visit `http://localhost:5001/api/wildfires` → JSON of current fires
-- **Frontend Map**: visit `http://localhost:3000` → Map with fire markers; click one and hit “Predict Fire Spread”
-
----
-
-## 🔧 Python Path for Spawn (Backend - `predictfirespread.js`)
-
-Make sure the `pythonPath` used in `ignis-ai-backend/routes/predictfirespread.js` matches your environment setup.
-
-🪟 **For Windows**:
-```js
-const python = 'ml\venv\Scripts\python.exe';
+# Terminal 3 — ignis-ai-frontend/
+npm start
 ```
 
-🍎 **For macOS (with venv)**:
-```js
-const python = 'ml/venv/bin/python3';
+Open `http://localhost:3000`. Express runs on port 5001 and FastAPI on 8000.
+The backend refresh worker runs on startup and every 15 minutes by default.
+
+## Main API endpoints
+
+| Method | Endpoint | Purpose |
+|---|---|---|
+| `GET` | `/api/wildfires` | Read the latest completed event snapshot |
+| `POST` | `/api/wildfires/refresh` | Request a guarded background refresh |
+| `POST` | `/api/detection-polygon` | Return official or estimated current boundary |
+| `POST` | `/api/predict-fire-spread` | Proxy boundary prediction to FastAPI |
+| `GET` | `http://127.0.0.1:8000/health` | Check loaded model/service health |
+
+## Tests
+
+```bash
+# Backend
+cd ignis-ai-backend && npm test
+
+# Python ML/geospatial tests
+cd ignis-ai-backend/ml && venv/bin/python -m unittest -v
+
+# Focused frontend tests and production build
+cd ignis-ai-frontend
+CI=true npm test -- --watchman=false --runInBand src/components
+npm run build
 ```
 
-If using **system Python** (without venv):
-```js
-const python = 'python3';
-```
+## Model and data notes
 
-🐧 **For Linux**:
-```js
-const python = 'python3';
-```
+The active model was trained from the Next Day Wildfire Spread TFRecords. The
+pipeline extracts boundary-point tables, applies a Fuel Model 4 Rothermel
+baseline, classifies spread/no-spread, and regresses residual movement only for
+positive points. Training preserves the dataset's supplied train/eval/test
+splits and logs metrics in `ml/experiments/runs.csv`.
 
-🎉 Our Ignis AI app is now running locally, ready to detect and predict wildfire spread with a single `npm start` for each service.
+The latest `boundary_physics_v2` experiment adds boundary/wind alignment, 7×7
+local fire density and slope-wind interaction. Against the v1 test baseline,
+classifier precision improved from 0.245 to 0.293, recall from 0.446 to 0.551,
+and positive-only residual RMSE from 2.545 km to 2.466 km. These are useful but
+still preliminary results, not operational accuracy.
 
+FastAPI loads the 19-feature v2 model. It derives boundary/wind alignment from
+the projected polygon, estimates terrain slope from a 1 km Open-Meteo elevation
+stencil, and uses local polygon area as an explicit proxy for the unavailable
+7×7 live-raster density. Live inference also uses fixed Fuel Model 4 assumptions
+and median fallbacks for features unavailable from Open-Meteo. Estimated
+satellite footprints represent recent thermal-observation geometry, not an
+official burned-area perimeter.
 
----
+## Data sources
 
-# Project Map - Ignis AI
-
-## ignis-ai-backend/
-
-```
-├─ models/
-│  ├─ Wildfire.js             # Mongoose schema for real-time fire detections
-│  ├─ Weather.js              # Schema for NOAA weather forecasts
-│  ├─ Topography.js           # Schema for terrain/elevation data
-│  ├─ HumanFactors.js         # Schema for human factors (population, roads, stations)
-│  └─ HistoricalWildfire.js   # Schema for archival fire statistics
-├─ routes/
-│  ├─ fireData.js             # GET  /api/wildfires → fetch NASA FIRMS CSV, parse & store
-│  ├─ weather.js              # GET  /api/weather    → fetch & store NOAA forecasts
-│  ├─ topography.js           # GET  /api/topography → pull terrain-RGB tiles & compute elevation
-│  ├─ humanFactors.js         # GET  /api/human-factors → (placeholder) external data
-│  └─ predictSpread.js        # POST /api/predict    → invoke ML inference (predict_spread.py)
-├─ ml/                        # Python ML pipeline and inference
-│  ├─ data/                   # (ignored) raw TFRecord files for training
-│  ├─ process_data_dual.py    # Extract features (classification + regression) from TFRecords
-│  ├─ train_classifier_advanced.py  # Train & save GradientBoostingClassifier
-│  ├─ train_regressor_advanced.py   # Train & save GradientBoostingRegressor
-│  ├─ wildfire_spread_classifier_advanced.joblib  # Pre-trained classifier model
-│  ├─ wildfire_spread_regressor_advanced.joblib   # Pre-trained regressor model
-│  └─ predict_spread.py       # Python inference: loads models, fetches real weather/elevation, returns GeoJSON
-├─ db.js                      # MongoDB connection setup
-├─ app.js                     # Express server, mounts all routes
-├─ .env                       # API keys (NASA, Mapbox, MongoDB URI)
-└─ package.json               # Node dependencies & start script
-```
-
-## ignis-ai-frontend/
-
-```
-└─ src/
-   ├─ api.js                  # Axios wrapper: getWildfireData(), getWeather(), getTopography(), predictFireSpread()
-   ├─ App.js                  # Top-level: holds filters, location, passes props
-   ├─ App.css                 # Full-screen styles
-   ├─ components/
-   │  ├─ MapComponent.jsx     # Mapbox map: loads GeoJSON, popups, predict button, ML visualization
-   │  ├─ FireControls.js      # Panel: refresh, filters, location search, nearby fires
-   │  └─ LocationSearch.js    # (unused) optional autocomplete
-   ├─ predictFireSpread.js    # Front-end helper to wrap POST /api/predict
-   ├─ index.js                # Renders <App />
-   └─ index.css
-```
-
----
-### 🔄 Data Flow End-to-End
-
-1. *Backend: Data Ingestion*  
-   - *fireData.js* calls NASA FIRMS CSV API every time /api/wildfires is hit.  
-   - CSV rows parsed (latitude, longitude, brightness, confidence, satellite, timestamp).  
-   - Parsed objects inserted into Mongo wildfires collection.  
-   - JSON response returned: { message, count, data: [...] }.
-
-2. *Frontend: Fetch & Display*  
-   - *api.js* exports getWildfireData() which does axios.get('/api/wildfires').  
-   - *MapComponent.jsx* (inside App) calls getWildfireData() → receives data.data array.  
-     - Stores in component state, builds a GeoJSON source → Mapbox circle layer.  
-     - Applies brightness & confidence filters passed from *FireControls*.  
-     - Popups show brightness category, confidence as exact % (e.g. "41%"), timestamp and reverse-geocoded address.
-     - Popups include a "Predict Fire Spread" button.
-
-3. *User Controls & Nearby Fires*  
-   - *FireControls.js* lets user:  
-     - Refresh the data.  
-     - Select brightness/confidence filters (passed up to App, then into MapComponent).  
-     - Search for a location or "Use My Location" → sets userLocation.  
-     - Enter a radius → MapComponent computes Haversine distances to all fires.  
-     - Reverse-geocodes the nearest fires, returns enriched list via onNearbyFiresUpdate.  
-     - Panel shows top 10 in‐range fires, sorted by "Closest" or "Most Dangerous".
-
-4. *Fire Spread Prediction*
-   - When user clicks "Predict Fire Spread" button in a fire popup:
-     - *MapComponent.jsx* calls predictFireSpread() from *api.js* with fire data.
-     - *api.js* sends POST request to /api/predict-fire-spread with fire location and brightness.
-     - Backend *predictFireSpread.js* route calls Python *predict_spread.py* script.
-     - Python script:
-       - Loads trained ML models (classifier and regressor).
-       - Fetches real-time weather data for the fire location.
-       - Predicts fire spread probability, direction, and distance.
-       - Returns GeoJSON visualization data and environmental factors.
-     - *MapComponent.jsx* displays:
-       - Fire spread polygon (yellow-orange gradient based on probability).
-       - Direction arrow showing primary spread direction.
-       - Points around perimeter showing spread probability.
-       - Popup with prediction details and environmental data.
-
-5. *Styling & UX*  
-   - *App.css* / *index.css* provide full-screen layout & basic resets.  
-   - The sliding panel is a fixed <div> over the map, fully responsive in width/height.  
-   - Map markers animate on hover; popups have a clean card style.
-   - Fire spread visualization uses color gradients to show probability.
-
----
-
-### 📌 Key Connections
-
-- *API endpoint* /api/wildfires ←→ *api.js* ←→ *MapComponent.jsx*  
-- *API endpoint* /api/predict-fire-spread ←→ *api.js* ←→ *MapComponent.jsx*
-- *App.js* holds global state:  
-  - brightnessFilter, confidenceFilter → passed to MapComponent  
-  - userLocation, range → passed to MapComponent  
-  - nearbyFires ← from MapComponent → passed to FireControls
-  - selectedFire, firePrediction → for fire spread prediction
-- *FireControls.js* UI ↔ callbacks to App.js (onChangeBrightness, onNearbyFiresUpdate, etc.)
-- *ML models* ↔ *predict_spread.py* ↔ *predictFireSpread.js* route ↔ frontend
-
----
-
-### 🔥 ML Component Details
-
-- **Models**: Two machine learning models work together:
-  - *Classifier*: Predicts if a fire will spread significantly (yes/no).
-  - *Regressor*: Predicts how much a fire will spread (spread ratio).
-
-- **Features Used**:
-  - Environmental data (elevation, wind, temperature, humidity)
-  - Fire characteristics (brightness, location)
-  - Derived features (wind components, drought-vegetation interaction)
-
-- **Visualization Logic**:
-  - Spread probability < 10%: Simple message, no visualization
-  - Spread probability ≥ 10%: Full visualization with spread polygon
-  - Spread probability 10-20%: "Possibly" will spread
-  - Spread probability ≥ 20%: "Yes" will spread
-
-- **Real-time Data**:
-  - Weather API provides current conditions at fire location
-  - Location-based estimates for drought and vegetation
-
-
-
-
+- NASA FIRMS — NOAA-20/NOAA-21 VIIRS active-fire observations
+- NIFC WFIGS — official incident locations, acreage, containment and perimeters
+- US Census TIGERweb — urban-area context
+- EPA GHGRP and EOG VIIRS flare catalogs — industrial heat-source exclusions
+- Open-Meteo and Copernicus GLO-90 — live weather and elevation
+- Next Day Wildfire Spread dataset — model training
 

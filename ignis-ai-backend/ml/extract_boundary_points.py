@@ -16,7 +16,7 @@ from typing import Iterable
 
 import numpy as np
 import tensorflow as tf
-from scipy.ndimage import binary_erosion
+from scipy.ndimage import binary_erosion, convolve, sobel
 
 from rothermel import RothermelResult, fuel_model_4_ros
 
@@ -30,9 +30,14 @@ ENVIRONMENT_FEATURES = (
     "elevation", "th", "vs", "tmmn", "tmmx", "sph",
     "pr", "pdsi", "NDVI", "population", "erc",
 )
+ENGINEERED_FEATURES = (
+    "wind_alignment_cosine", "neighboring_fire_pixels",
+    "slope_wind_interaction",
+)
+NEIGHBORHOOD_SIZE = 7
 OUTPUT_COLUMNS = (
     "sample_id", "split", "source_file", "record_index", "row", "column",
-    "x_m", "y_m", *ENVIRONMENT_FEATURES, "spreads",
+    "x_m", "y_m", *ENVIRONMENT_FEATURES, *ENGINEERED_FEATURES, "spreads",
     "target_row", "target_column", "target_x_m", "target_y_m",
     "actual_dx_m", "actual_dy_m", "actual_distance_m",
     "physics_ros_m_min", "physics_heading_deg", "physics_distance_24h_m",
@@ -65,6 +70,43 @@ def _required_square(example: tf.train.Example, name: str) -> np.ndarray:
 def _boundary(mask: np.ndarray) -> np.ndarray:
     active = np.nan_to_num(mask, nan=0.0) > 0
     return active & ~binary_erosion(active, structure=np.ones((3, 3)), border_value=0)
+
+
+def _engineered_grids(
+    mask: np.ndarray,
+    wind_speed: np.ndarray,
+    wind_from: np.ndarray,
+    east_slope: np.ndarray,
+    north_slope: np.ndarray,
+) -> dict[str, np.ndarray]:
+    """Build current-fire geometry features without using the future mask."""
+    active = (np.nan_to_num(mask, nan=0.0) > 0).astype(np.float32)
+    # The active-mask gradient points inward; negate it for the outward normal.
+    outward_east = -sobel(active, axis=1, mode="constant")
+    outward_north = sobel(active, axis=0, mode="constant")
+    normal_length = np.hypot(outward_east, outward_north)
+    downwind_radians = np.deg2rad(
+        (np.nan_to_num(wind_from, nan=0.0) + 180.0) % 360.0
+    )
+    alignment = np.divide(
+        outward_east * np.sin(downwind_radians)
+        + outward_north * np.cos(downwind_radians),
+        normal_length,
+        out=np.zeros_like(normal_length),
+        where=normal_length > 0,
+    )
+    alignment = np.clip(alignment, -1.0, 1.0)
+
+    kernel = np.ones((NEIGHBORHOOD_SIZE, NEIGHBORHOOD_SIZE), dtype=np.float32)
+    kernel[NEIGHBORHOOD_SIZE // 2, NEIGHBORHOOD_SIZE // 2] = 0.0
+    neighboring = convolve(active, kernel, mode="constant", cval=0.0)
+    slope = np.hypot(east_slope, north_slope)
+    interaction = slope * np.nan_to_num(wind_speed, nan=0.0) * alignment
+    return {
+        "wind_alignment_cosine": alignment,
+        "neighboring_fire_pixels": neighboring,
+        "slope_wind_interaction": interaction,
+    }
 
 
 def _angle_difference(first: float, second: float) -> float:
@@ -137,6 +179,9 @@ def extract_example(
         elevation = np.nan_to_num(elevation, nan=float(np.median(finite)) if finite.size else 0.0)
     down_slope, east_slope = np.gradient(elevation, CELL_SIZE_METERS)
     north_slope = -down_slope
+    engineered = _engineered_grids(
+        current, grids["vs"], grids["th"], east_slope, north_slope
+    )
     physics: dict[tuple[int, int], RothermelResult] = {}
     for row, column in np.argwhere(_boundary(current)):
         row, column = int(row), int(column)
@@ -182,6 +227,7 @@ def extract_example(
             "residual_distance_m": actual_distance - physics_baseline,
         }
         output.update({name: float(grids[name][row, column]) for name in ENVIRONMENT_FEATURES})
+        output.update({name: float(engineered[name][row, column]) for name in ENGINEERED_FEATURES})
         rows.append(output)
     return rows
 
@@ -222,6 +268,11 @@ def extract_files(
         "feature_records_present": feature_records_present,
         "cell_size_m": CELL_SIZE_METERS, "coordinates": "local chip-centred metric offsets",
         "incident_ids_available": False, "columns": list(OUTPUT_COLUMNS),
+        "engineered_features": {
+            "wind_alignment_cosine": "Sobel outward normal dotted with downwind unit vector",
+            "neighboring_fire_pixels": f"active pixels in a {NEIGHBORHOOD_SIZE}x{NEIGHBORHOOD_SIZE} window excluding centre",
+            "slope_wind_interaction": "terrain slope magnitude * wind speed * wind alignment",
+        },
         "target_matching": {
             "fuel_model": "Anderson 4 (brush/chaparral)",
             "distance_multiplier": MATCH_DISTANCE_MULTIPLIER,

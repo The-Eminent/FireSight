@@ -1,0 +1,14 @@
+{
+  "name": "ignis-ai",
+  "version": "1.0.0",
+  "private": true,
+  "scripts": {
+    "dev": "concurrently --kill-others --names fastapi,backend,frontend --prefix-colors blue,green,magenta \"npm run dev:fastapi\" \"npm run dev:backend\" \"npm run dev:frontend\"",
+    "dev:fastapi": "cd ignis-ai-backend && ml/venv/bin/uvicorn inference_api:app --app-dir ml --host 127.0.0.1 --port 8000",
+    "dev:backend": "npm --prefix ignis-ai-backend start",
+    "dev:frontend": "npm --prefix ignis-ai-frontend start"
+  },
+  "devDependencies": {
+    "concurrently": "^9.2.1"
+  }
+}

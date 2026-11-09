@@ -16,17 +16,23 @@ import requests
 from fastapi import FastAPI, HTTPException, Request
 from pydantic import BaseModel, Field
 from pyproj import CRS, Transformer
-from shapely.geometry import MultiPolygon, Polygon, mapping, shape
+from shapely.geometry import MultiPolygon, Polygon, box, mapping, shape
 from xgboost import XGBClassifier, XGBRegressor
 
 from rothermel import fuel_model_4_ros
-from train_hurdle import FEATURE_COLUMNS
-
-
 FORECAST_URL = "https://api.open-meteo.com/v1/forecast"
 ELEVATION_URL = "https://api.open-meteo.com/v1/elevation"
 MAX_VERTEX_COUNT = 1_000
 MAX_SPREAD_METERS = 10_000.0
+NDWS_PIXEL_METERS = 1_000.0
+DENSITY_HALF_WINDOW_METERS = 3_500.0
+INFERENCE_FEATURE_COLUMNS = (
+    "elevation", "vs", "wind_from_sin", "wind_from_cos", "tmmn", "tmmx",
+    "sph", "pr", "pdsi", "NDVI", "population", "erc",
+    "physics_ros_m_min", "physics_heading_sin", "physics_heading_cos",
+    "physics_baseline_distance_m", "wind_alignment_cosine",
+    "neighboring_fire_pixels", "slope_wind_interaction",
+)
 
 
 class GeoJSONFeature(BaseModel):
@@ -127,6 +133,53 @@ def _polygon_rings(geometry: Polygon | MultiPolygon) -> list[list[tuple[float, f
             for ring in (polygon.exterior, *polygon.interiors)]
 
 
+def _ring_hole_flags(geometry: Polygon | MultiPolygon) -> list[bool]:
+    polygons = [geometry] if isinstance(geometry, Polygon) else list(geometry.geoms)
+    return [is_hole for polygon in polygons
+            for is_hole in (False, *(True for _ in polygon.interiors))]
+
+
+def _live_geometry_features(
+    geometry: Polygon | MultiPolygon,
+    rings: list[list[tuple[float, float]]],
+    holes: list[bool],
+    wind_from_degrees: float,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Approximate NDWS raster geometry features from a metric live polygon."""
+    downwind = radians((wind_from_degrees + 180.0) % 360.0)
+    wind_east, wind_north = sin(downwind), cos(downwind)
+    alignments, densities = [], []
+    for ring, is_hole in zip(rings, holes):
+        area_twice = sum(
+            ring[index][0] * ring[(index + 1) % len(ring)][1]
+            - ring[(index + 1) % len(ring)][0] * ring[index][1]
+            for index in range(len(ring))
+        )
+        orientation = 1.0 if area_twice >= 0.0 else -1.0
+        outward_sign = -orientation if is_hole else orientation
+        for index, (east, north) in enumerate(ring):
+            previous, following = ring[index - 1], ring[(index + 1) % len(ring)]
+            tangent_east = following[0] - previous[0]
+            tangent_north = following[1] - previous[1]
+            normal_east = outward_sign * tangent_north
+            normal_north = -outward_sign * tangent_east
+            length = np.hypot(normal_east, normal_north)
+            alignment = (
+                (normal_east * wind_east + normal_north * wind_north) / length
+                if length else 0.0
+            )
+            alignments.append(float(np.clip(alignment, -1.0, 1.0)))
+            local_window = box(
+                east - DENSITY_HALF_WINDOW_METERS,
+                north - DENSITY_HALF_WINDOW_METERS,
+                east + DENSITY_HALF_WINDOW_METERS,
+                north + DENSITY_HALF_WINDOW_METERS,
+            )
+            active_pixels = geometry.intersection(local_window).area / NDWS_PIXEL_METERS**2
+            densities.append(float(np.clip(active_pixels - 1.0, 0.0, 48.0)))
+    return np.asarray(alignments), np.asarray(densities)
+
+
 def _rebuild_geometry(
     template: Polygon | MultiPolygon, rings: list[list[tuple[float, float]]],
 ) -> Polygon | MultiPolygon:
@@ -151,7 +204,7 @@ class PredictionService:
         self, classifier: Any, regressor: Any, metadata: dict[str, Any],
         environment: OpenMeteoClient | Any,
     ) -> None:
-        if metadata["features"] != list(FEATURE_COLUMNS):
+        if metadata["features"] != list(INFERENCE_FEATURE_COLUMNS):
             raise ValueError("model metadata does not match the inference feature contract")
         self.classifier = classifier
         self.regressor = regressor
@@ -185,9 +238,39 @@ class PredictionService:
         if len(coordinates) < 3 or len(coordinates) > MAX_VERTEX_COUNT:
             raise ValueError(f"boundary must contain 3 to {MAX_VERTEX_COUNT} vertices")
         centroid = geometry.centroid
+        metric_crs = utm_crs(centroid.x, centroid.y)
+        forward = Transformer.from_crs("EPSG:4326", metric_crs, always_xy=True)
+        inverse = Transformer.from_crs(metric_crs, "EPSG:4326", always_xy=True)
+        x, y = forward.transform(
+            [coordinate[0] for coordinate in coordinates],
+            [coordinate[1] for coordinate in coordinates],
+        )
+        metric_rings, offset = [], 0
+        for ring in rings:
+            metric_rings.append(list(zip(x[offset:offset + len(ring)], y[offset:offset + len(ring)])))
+            offset += len(ring)
+        metric_geometry = _rebuild_geometry(geometry, metric_rings)
+
         weather = self.environment.weather(centroid.y, centroid.x)
-        elevations = self.environment.elevations(coordinates)
-        physics = fuel_model_4_ros(weather.wind_speed_m_s, weather.wind_from_degrees)
+        center_east, center_north = forward.transform(centroid.x, centroid.y)
+        sample_lon, sample_lat = inverse.transform(
+            [center_east, center_east + NDWS_PIXEL_METERS, center_east],
+            [center_north, center_north, center_north + NDWS_PIXEL_METERS],
+        )
+        elevation_values = self.environment.elevations(
+            coordinates + list(zip(sample_lon, sample_lat))
+        )
+        elevations, terrain = elevation_values[:-3], elevation_values[-3:]
+        slope_east = (terrain[1] - terrain[0]) / NDWS_PIXEL_METERS
+        slope_north = (terrain[2] - terrain[0]) / NDWS_PIXEL_METERS
+        slope = float(np.hypot(slope_east, slope_north))
+        physics = fuel_model_4_ros(
+            weather.wind_speed_m_s, weather.wind_from_degrees, slope_east, slope_north
+        )
+        alignment, density = _live_geometry_features(
+            metric_geometry, metric_rings, _ring_hole_flags(geometry),
+            weather.wind_from_degrees,
+        )
         match_radius = min(MAX_SPREAD_METERS, max(1_000.0, physics.distance_24h_m * 1.5))
         baseline = min(physics.distance_24h_m, match_radius)
         defaults = self.metadata["runtime_defaults"]
@@ -207,7 +290,10 @@ class PredictionService:
             "physics_heading_sin": sin(radians(physics.heading_degrees)),
             "physics_heading_cos": cos(radians(physics.heading_degrees)),
             "physics_baseline_distance_m": baseline,
-        }, columns=FEATURE_COLUMNS, dtype=np.float32)
+            "wind_alignment_cosine": alignment,
+            "neighboring_fire_pixels": density,
+            "slope_wind_interaction": slope * weather.wind_speed_m_s * alignment,
+        }, columns=INFERENCE_FEATURE_COLUMNS, dtype=np.float32)
         probabilities = self.classifier.predict_proba(rows)[:, 1]
         spreading = probabilities >= float(self.metadata["classifier_threshold"])
         residuals = np.zeros(len(rows), dtype=np.float32)
@@ -215,13 +301,6 @@ class PredictionService:
             residuals[spreading] = self.regressor.predict(rows.loc[spreading])
         distances = np.where(spreading, np.clip(baseline + residuals, 0, MAX_SPREAD_METERS), 0)
 
-        metric_crs = utm_crs(centroid.x, centroid.y)
-        forward = Transformer.from_crs("EPSG:4326", metric_crs, always_xy=True)
-        inverse = Transformer.from_crs(metric_crs, "EPSG:4326", always_xy=True)
-        x, y = forward.transform(
-            [coordinate[0] for coordinate in coordinates],
-            [coordinate[1] for coordinate in coordinates],
-        )
         east = np.sin(np.deg2rad(physics.heading_degrees)) * distances
         north = np.cos(np.deg2rad(physics.heading_degrees)) * distances
         predicted_lon, predicted_lat = inverse.transform(np.asarray(x) + east, np.asarray(y) + north)
@@ -245,6 +324,8 @@ class PredictionService:
                 "max_displacement_m": float(distances.max()),
                 "physics_heading_degrees": physics.heading_degrees,
                 "physics_baseline_distance_m": baseline, "utm_epsg": metric_crs.to_epsg(),
+                "terrain_slope": slope,
+                "neighboring_fire_pixels_proxy": "local polygon area in a 7 km window",
                 "weather": {
                     "temperature_c": weather.temperature_c,
                     "relative_humidity_percent": weather.humidity_percent,
@@ -255,7 +336,8 @@ class PredictionService:
                 "fallback_features": list(defaults),
                 "data_sources": ["Open-Meteo", "Copernicus DEM GLO-90 via Open-Meteo"],
                 "limitations": [
-                    "Fuel Model 4 and zero terrain slope are MVP assumptions",
+                    "Fuel Model 4 is an MVP fuel assumption",
+                    "Neighboring fire pixels are inferred from polygon area, not a live raster",
                     "PDSI, NDVI, population and ERC use training-set medians",
                 ],
             },
@@ -266,7 +348,7 @@ def resolve_metadata_path() -> Path:
     configured = os.getenv("HURDLE_METADATA_PATH")
     if configured:
         return Path(configured).expanduser().resolve()
-    matches = sorted((Path(__file__).parent / "models").glob("*_hurdle_v1_metadata.json"))
+    matches = sorted((Path(__file__).parent / "models").glob("*_hurdle_v2_metadata.json"))
     if not matches:
         raise RuntimeError("no hurdle model metadata found")
     return matches[-1]
@@ -278,7 +360,7 @@ async def lifespan(application: FastAPI):
     yield
 
 
-app = FastAPI(title="Ignis AI Spread Inference", version="1.0.0", lifespan=lifespan)
+app = FastAPI(title="Ignis AI Spread Inference", version="2.0.0", lifespan=lifespan)
 
 
 @app.get("/health")
