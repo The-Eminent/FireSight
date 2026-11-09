@@ -1,4 +1,4 @@
-import { predictionSummary } from './prediction';
+import { predictionErrorMessage, predictionSummary } from './prediction';
 
 test('maps FastAPI GeoJSON properties into display units', () => {
   const summary = predictionSummary({ properties: {
@@ -28,4 +28,11 @@ test('maps FastAPI GeoJSON properties into display units', () => {
 
 test('does not claim spread when no boundary vertices pass the hurdle', () => {
   expect(predictionSummary({ properties: { spreading_vertices: 0 } }).willSpread).toBe(false);
+});
+
+test('uses backend prediction errors and a clear unreachable-service fallback', () => {
+  expect(predictionErrorMessage({ response: { data: { error: 'Boundary rejected' } } }))
+    .toBe('Boundary rejected');
+  expect(predictionErrorMessage(new Error('Network Error')))
+    .toBe('Prediction service is unavailable. Please try again.');
 });

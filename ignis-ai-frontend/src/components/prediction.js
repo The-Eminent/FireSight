@@ -19,3 +19,8 @@ export function predictionSummary(feature) {
     humidityPercent: finiteNumber(weather.relative_humidity_percent)
   };
 }
+
+export function predictionErrorMessage(error) {
+  return error?.response?.data?.error
+    || 'Prediction service is unavailable. Please try again.';
+}

@@ -28,7 +28,7 @@ import {
   predictionCoordinates
 } from './detectionStatus';
 import { filterDetectionEvents } from './eventFilters';
-import { predictionSummary } from './prediction';
+import { predictionErrorMessage, predictionSummary } from './prediction';
 
 mapboxgl.accessToken = process.env.REACT_APP_MAPBOX_TOKEN;
 const R_EARTH = 3958.8;
@@ -100,9 +100,9 @@ const MapComponent = forwardRef(({
   const clickHandlerRef = useRef();
   const activePopupRef  = useRef();
   const perimeterRequestRef = useRef(0);
+  const predictionInFlightRef = useRef(false);
   const currentPerimeterRef = useRef(null);
   const [wildfires, setWildfires] = useState([]);
-  const [isPredicting, setIsPredicting] = useState(false);
 
   const cancelPendingPerimeterRequest = () => {
     perimeterRequestRef.current += 1;
@@ -226,42 +226,39 @@ const MapComponent = forwardRef(({
 
   // Handle fire spread prediction
   const handlePredictFireSpread = async (
-    fireProps, clusterCoordinates, officialIncidentId
+    fireProps, clusterCoordinates, officialIncidentId, button
   ) => {
-    if (isPredicting) return;
-    
-    setIsPredicting(true);
+    if (predictionInFlightRef.current) return;
+    predictionInFlightRef.current = true;
+    const errorElement = button.closest('.wildfire-popup')
+      ?.querySelector('[data-prediction-error]');
+    button.disabled = true;
+    button.textContent = 'Predicting...';
+    if (errorElement) errorElement.textContent = '';
+
     try {
-      // Close existing popup
-      closeActivePopup();
-      
       const boundary = currentPerimeterRef.current || await getDetectionPolygon({
         clusterCoordinates, officialIncidentId
       });
-      removeDetectionPerimeter();
+      currentPerimeterRef.current = boundary;
+      displayDetectionPerimeter(boundary);
       const prediction = await predictFireSpread(boundary);
       displayFirePrediction(prediction);
 
       // Show prediction results in a new popup
+      closeActivePopup();
       showPredictionPopup(fireProps, prediction);
     } catch (error) {
       console.error('Failed to predict fire spread:', error);
-      // Show error in popup
-      const map = mapRef.current;
-      if (map) {
-        const popup = new mapboxgl.Popup()
-          .setLngLat([fireProps.longitude, fireProps.latitude])
-          .setHTML(`
-            <div class="wildfire-popup">
-              <h4>${getSeverityIcon(fireProps.brightnessCat)} ${fireProps.brightnessCat} Fire</h4>
-              <p>Error predicting fire spread. Please try again.</p>
-            </div>
-          `)
-          .addTo(map);
-        trackPopup(popup);
+      if (errorElement?.isConnected) {
+        errorElement.textContent = predictionErrorMessage(error);
       }
     } finally {
-      setIsPredicting(false);
+      predictionInFlightRef.current = false;
+      if (button.isConnected) {
+        button.disabled = false;
+        button.textContent = 'Predict 24h Spread';
+      }
     }
   };
 
@@ -343,8 +340,8 @@ const MapComponent = forwardRef(({
       source: 'fire-spread-prediction',
       paint: {
         'fill-color': '#f97316',
-        'fill-opacity': 0.35,
-        'fill-outline-color': '#ff0000'
+        'fill-opacity': 0.3,
+        'fill-outline-color': '#c2410c'
       }
     });
     
@@ -354,8 +351,9 @@ const MapComponent = forwardRef(({
       type: 'line',
       source: 'fire-spread-prediction',
       paint: {
-        'line-color': '#ff0000',
-        'line-width': 3
+        'line-color': '#c2410c',
+        'line-width': 3,
+        'line-dasharray': [2, 2]
       }
     });
 
@@ -492,8 +490,9 @@ const MapComponent = forwardRef(({
             </button>
             <p class="perimeter-error" data-perimeter-error></p>` : ''}
             ${hasObservation ? `<button id="predict-spread-btn" class="predict-spread-btn">
-              ${isPredicting ? 'Predicting...' : 'Predict Fire Spread'}
-            </button>` : ''}
+              Predict 24h Spread
+            </button>
+            <p class="prediction-error" data-prediction-error></p>` : ''}
           </div>
         `)
         .addTo(map);
@@ -510,7 +509,7 @@ const MapComponent = forwardRef(({
       const predictBtn = document.getElementById('predict-spread-btn');
       if (predictBtn) {
         predictBtn.addEventListener('click', () => handlePredictFireSpread(
-          fireProps, eventClusterCoordinates, officialIncidentId
+          fireProps, eventClusterCoordinates, officialIncidentId, predictBtn
         ));
       }
     };
@@ -664,6 +663,8 @@ const MapComponent = forwardRef(({
       .predict-spread-btn:hover {
         background-color: #45a049;
       }
+      .predict-spread-btn:disabled { cursor: wait; opacity: 0.75; }
+      .prediction-error { color: #b91c1c; margin: 6px 0 0; }
       .prediction-results {
         margin-top: 10px;
         padding-top: 10px;
