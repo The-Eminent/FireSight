@@ -1,0 +1,66 @@
+# Environment files and secrets
+.env
+.env.*
+!.env.example
+!**/.env.example
+
+# Dependencies
+node_modules/
+.pnp
+.pnp.js
+
+# Python environments and packaging
+venv/
+.venv/
+*.egg-info/
+
+# Raw training data and generated ML tables
+*.tfrecord
+*.tfrecords
+ignis-ai-backend/data/ndws_tfrecords/
+ignis-ai-backend/data/processed/
+*.npy
+*.npz
+
+# Python/test caches and coverage
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+coverage/
+htmlcov/
+
+# Build files
+build/
+dist/
+.cache/
+
+# IDE
+.vscode/
+.idea/
+
+# OS files
+.DS_Store
+thumbs.db
+
+# Debug logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# Editor swap and temporary files
+*.swp
+*.swo
+*.tmp
+*~
+
+# Local agent context and working notes
+/AGENTS.md
+/PROJECT_MAP.md
+/DECISIONS.md
+/LEARNINGS.md
+/flow.md

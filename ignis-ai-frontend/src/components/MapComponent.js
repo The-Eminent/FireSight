@@ -1,0 +1,706 @@
+// src/components/MapComponent.jsx
+import React, {
+  useEffect,
+  useRef,
+  useState,
+  useImperativeHandle,
+  forwardRef
+} from 'react';
+import mapboxgl from 'mapbox-gl';
+import 'mapbox-gl/dist/mapbox-gl.css';
+import {
+  getDetectionPolygon,
+  getWildfireData,
+  predictFireSpread,
+  requestWildfireRefresh
+} from '../api';
+import { confidenceToPercent } from './confidence';
+import {
+  canShowPerimeter,
+  eventMarkerCoordinates,
+  geoJsonBounds,
+  parseClusterCoordinates,
+  perimeterActionLabel,
+  perimeterResultLabel
+} from './perimeter';
+import {
+  detectionStatusLabel,
+  predictionCoordinates
+} from './detectionStatus';
+import { filterDetectionEvents } from './eventFilters';
+import { predictionSummary } from './prediction';
+
+mapboxgl.accessToken = process.env.REACT_APP_MAPBOX_TOKEN;
+const R_EARTH = 3958.8;
+const PERIMETER_SOURCE = 'current-fire-perimeter';
+const PERIMETER_FILL_LAYER = 'current-fire-perimeter-fill';
+const PERIMETER_LINE_LAYER = 'current-fire-perimeter-line';
+
+// Helpers
+function getBrightnessCategory(b) {
+  if (!Number.isFinite(Number(b))) return 'Reported';
+  if (b >= 375) return 'Extreme';
+  if (b >= 350) return 'Severe';
+  if (b >= 325) return 'Moderate';
+  return 'Small';
+}
+
+function getSeverityIcon(cat) {
+  if (cat === 'Reported') return '📍';
+  if (cat === 'Extreme') return '🔥🔥🔥';
+  if (cat === 'Severe')  return '🔴🔥';
+  if (cat === 'Moderate') return '⚠️';
+  return '🌡️';
+}
+
+function escapeHtml(value) {
+  return String(value ?? '')
+    .replaceAll('&', '&amp;')
+    .replaceAll('<', '&lt;')
+    .replaceAll('>', '&gt;')
+    .replaceAll('"', '&quot;')
+    .replaceAll("'", '&#039;');
+}
+
+function haversineDistance(lat1, lon1, lat2, lon2) {
+  const dLat = ((lat2 - lat1) * Math.PI) / 180;
+  const dLon = ((lon2 - lon1) * Math.PI) / 180;
+  const a =
+    Math.sin(dLat / 2) ** 2 +
+    Math.cos((lat1 * Math.PI) / 180) *
+      Math.cos((lat2 * Math.PI) / 180) *
+      Math.sin(dLon / 2) ** 2;
+  return R_EARTH * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+}
+
+async function reverseGeocode(lat, lon, token) {
+  try {
+    const url = `https://api.mapbox.com/geocoding/v5/mapbox.places/${lon},${lat}.json?access_token=${token}&limit=1`;
+    const resp = await fetch(url);
+    const { features } = await resp.json();
+    return features?.[0]?.place_name || 'Unknown';
+  } catch {
+    return 'Unknown';
+  }
+}
+
+const MapComponent = forwardRef(({
+  eventTypes,
+  recencyHours,
+  boundaryFilter,
+  onFiresUpdated,
+  setIsFetching,
+  mapStyle,
+  userLocation,
+  range,
+  onNearbyFiresUpdate
+}, ref) => {
+  const mapContainerRef = useRef();
+  const mapRef          = useRef();
+  const clickHandlerRef = useRef();
+  const activePopupRef  = useRef();
+  const perimeterRequestRef = useRef(0);
+  const currentPerimeterRef = useRef(null);
+  const [wildfires, setWildfires] = useState([]);
+  const [isPredicting, setIsPredicting] = useState(false);
+
+  const cancelPendingPerimeterRequest = () => {
+    perimeterRequestRef.current += 1;
+  };
+
+  const removeDetectionPerimeter = () => {
+    cancelPendingPerimeterRequest();
+    currentPerimeterRef.current = null;
+    const map = mapRef.current;
+    if (!map) return;
+    if (map.getLayer(PERIMETER_LINE_LAYER)) map.removeLayer(PERIMETER_LINE_LAYER);
+    if (map.getLayer(PERIMETER_FILL_LAYER)) map.removeLayer(PERIMETER_FILL_LAYER);
+    if (map.getSource(PERIMETER_SOURCE)) map.removeSource(PERIMETER_SOURCE);
+  };
+
+  const trackPopup = popup => {
+    activePopupRef.current = popup;
+    popup.on('close', () => {
+      if (activePopupRef.current === popup) activePopupRef.current = null;
+      cancelPendingPerimeterRequest();
+    });
+  };
+
+  const closeActivePopup = () => {
+    if (activePopupRef.current) activePopupRef.current.remove();
+  };
+
+  // 1) Fetch & cache data
+  const fetchWildfires = async (requestRefresh = false) => {
+    setIsFetching(true);
+    try {
+      if (requestRefresh) await requestWildfireRefresh();
+      const { data } = await getWildfireData();
+      const arr = data.data || [];
+      setWildfires(arr);
+      onFiresUpdated?.(arr.length);
+      updateWildfireSource(arr);
+    } finally {
+      setIsFetching(false);
+    }
+  };
+  useImperativeHandle(ref, () => ({
+    refreshWildfires: () => fetchWildfires(true)
+  }), []);
+
+  // 2) Update wildfire layer source
+  const updateWildfireSource = (dataArray = wildfires) => {
+    const map = mapRef.current;
+    if (!map) return;
+    const src = map.getSource('wildfires-source');
+    if (!src) return;
+
+    const filtered = filterDetectionEvents(dataArray, {
+      eventTypes,
+      recencyHours,
+      boundaryFilter
+    });
+    onFiresUpdated?.(filtered.length);
+
+    src.setData({
+      type: 'FeatureCollection',
+      features: filtered.map(f => {
+        const clusterCoordinates = parseClusterCoordinates(f.cluster_coordinates);
+        return {
+          type: 'Feature',
+          geometry: { type: 'Point', coordinates: eventMarkerCoordinates(f) },
+          properties: {
+          brightnessCat:  getBrightnessCategory(f.brightness),
+          confidenceRaw:  f.confidence,
+          timestamp:      f.timestamp,
+          brightness:     f.brightness,
+          representativeLatitude: f.representativeLatitude,
+          representativeLongitude: f.representativeLongitude,
+          latitude:       f.latitude,
+          longitude:      f.longitude,
+          status:         f.status,
+          incidentName:   f.incidentName || '',
+          officialIncidentId: f.officialIncidentId || '',
+          observationCount: f.observationCount,
+          sources:        (f.sources || []).join(', '),
+          incidentSizeAcres: f.incidentSizeAcres,
+          percentContained: f.percentContained,
+          hasOfficialPerimeter: Boolean(f.hasOfficialPerimeter),
+          firstObservedAt: f.firstObservedAt,
+          clusterCoordinates: JSON.stringify(clusterCoordinates)
+          }
+        }
+      })
+    });
+  };
+
+  // 3) User location marker
+  const updateUserSource = () => {
+    const map = mapRef.current;
+    if (!map) return;
+    const src = map.getSource('user-source');
+    if (!src) return;
+    if (!userLocation) {
+      src.setData({ type: 'FeatureCollection', features: [] });
+      return;
+    }
+    src.setData({
+      type: 'FeatureCollection',
+      features: [{
+        type: 'Feature',
+        geometry: { type: 'Point', coordinates: [userLocation.lng, userLocation.lat] },
+        properties: {}
+      }]
+    });
+    const z = map.getZoom();
+    map.setCenter([userLocation.lng, userLocation.lat]);
+    map.setZoom(z);
+  };
+
+  // Helper to convert degrees to cardinal direction
+  const getDirectionName = (degrees) => {
+    const directions = ['N', 'NE', 'E', 'SE', 'S', 'SW', 'W', 'NW'];
+    const index = Math.round(((degrees % 360) / 45)) % 8;
+    return directions[index];
+  };
+
+  // Handle fire spread prediction
+  const handlePredictFireSpread = async (
+    fireProps, clusterCoordinates, officialIncidentId
+  ) => {
+    if (isPredicting) return;
+    
+    setIsPredicting(true);
+    try {
+      // Close existing popup
+      closeActivePopup();
+      
+      const boundary = currentPerimeterRef.current || await getDetectionPolygon({
+        clusterCoordinates, officialIncidentId
+      });
+      removeDetectionPerimeter();
+      const prediction = await predictFireSpread(boundary);
+      displayFirePrediction(prediction);
+
+      // Show prediction results in a new popup
+      showPredictionPopup(fireProps, prediction);
+    } catch (error) {
+      console.error('Failed to predict fire spread:', error);
+      // Show error in popup
+      const map = mapRef.current;
+      if (map) {
+        const popup = new mapboxgl.Popup()
+          .setLngLat([fireProps.longitude, fireProps.latitude])
+          .setHTML(`
+            <div class="wildfire-popup">
+              <h4>${getSeverityIcon(fireProps.brightnessCat)} ${fireProps.brightnessCat} Fire</h4>
+              <p>Error predicting fire spread. Please try again.</p>
+            </div>
+          `)
+          .addTo(map);
+        trackPopup(popup);
+      }
+    } finally {
+      setIsPredicting(false);
+    }
+  };
+
+  const displayDetectionPerimeter = feature => {
+    const map = mapRef.current;
+    if (!map) return;
+    if (map.getLayer(PERIMETER_LINE_LAYER)) map.removeLayer(PERIMETER_LINE_LAYER);
+    if (map.getLayer(PERIMETER_FILL_LAYER)) map.removeLayer(PERIMETER_FILL_LAYER);
+    if (map.getSource(PERIMETER_SOURCE)) map.removeSource(PERIMETER_SOURCE);
+
+    map.addSource(PERIMETER_SOURCE, { type: 'geojson', data: feature });
+    map.addLayer({
+      id: PERIMETER_FILL_LAYER,
+      type: 'fill',
+      source: PERIMETER_SOURCE,
+      paint: { 'fill-color': '#ef4444', 'fill-opacity': 0.4 }
+    });
+    map.addLayer({
+      id: PERIMETER_LINE_LAYER,
+      type: 'line',
+      source: PERIMETER_SOURCE,
+      paint: { 'line-color': '#b91c1c', 'line-width': 2 }
+    });
+
+    const bounds = geoJsonBounds(feature);
+    if (bounds) map.fitBounds(bounds, { padding: 60, duration: 1000, maxZoom: 14 });
+  };
+
+  const handleShowCurrentPerimeter = async (clusterCoordinates, officialIncidentId, button) => {
+    const errorElement = button.closest('.wildfire-popup')
+      ?.querySelector('[data-perimeter-error]');
+    const requestId = ++perimeterRequestRef.current;
+    button.disabled = true;
+    button.textContent = 'Loading Perimeter...';
+    if (errorElement) errorElement.textContent = '';
+
+    try {
+      const feature = await getDetectionPolygon({ clusterCoordinates, officialIncidentId });
+      if (requestId !== perimeterRequestRef.current) return;
+      currentPerimeterRef.current = feature;
+      displayDetectionPerimeter(feature);
+      if (button.isConnected) {
+        button.textContent = perimeterResultLabel(feature?.properties?.source);
+      }
+    } catch (error) {
+      if (requestId !== perimeterRequestRef.current) return;
+      console.error('Failed to load current fire perimeter:', error);
+      if (button.isConnected) {
+        button.disabled = false;
+        button.textContent = button.dataset.defaultLabel || 'Show Current Perimeter';
+      }
+      if (errorElement?.isConnected) errorElement.textContent = 'Unable to load perimeter. Please try again.';
+    }
+  };
+
+  // Display fire prediction on map
+  const displayFirePrediction = (prediction) => {
+    const map = mapRef.current;
+    if (!map) return;
+    
+    // Remove any existing prediction layers
+    if (map.getSource('fire-spread-prediction')) {
+      if (map.getLayer('fire-spread-direction')) map.removeLayer('fire-spread-direction');
+      if (map.getLayer('fire-spread-area')) map.removeLayer('fire-spread-area');
+      if (map.getLayer('fire-spread-points')) map.removeLayer('fire-spread-points');
+      map.removeSource('fire-spread-prediction');
+    }
+    
+    // Add the prediction source
+    map.addSource('fire-spread-prediction', {
+      type: 'geojson',
+      data: prediction
+    });
+    
+    // Add the spread area layer
+    map.addLayer({
+      id: 'fire-spread-area',
+      type: 'fill',
+      source: 'fire-spread-prediction',
+      paint: {
+        'fill-color': '#f97316',
+        'fill-opacity': 0.35,
+        'fill-outline-color': '#ff0000'
+      }
+    });
+    
+    // Add a clear outline around the predicted boundary.
+    map.addLayer({
+      id: 'fire-spread-direction',
+      type: 'line',
+      source: 'fire-spread-prediction',
+      paint: {
+        'line-color': '#ff0000',
+        'line-width': 3
+      }
+    });
+
+    const bounds = geoJsonBounds(prediction);
+    if (bounds) map.fitBounds(bounds, { padding: 60, duration: 1000, maxZoom: 14 });
+  };
+
+  // Show prediction results in popup
+  const showPredictionPopup = (fireProps, prediction) => {
+    const map = mapRef.current;
+    if (!map) return;
+    
+    const summary = predictionSummary(prediction);
+    const popupContent = `
+      <div class="wildfire-popup">
+        <h4>${getSeverityIcon(fireProps.brightnessCat)} ${fireProps.brightnessCat} Fire</h4>
+        <div class="prediction-results">
+          <h5>24-Hour Spread Prediction</h5>
+          <p><strong>Will spread:</strong> ${summary.willSpread ? 'Yes' : 'No'}</p>
+          <p><strong>Mean boundary probability:</strong> ${summary.probabilityPercent}%</p>
+          <p><strong>Maximum displacement:</strong> ${summary.distanceKm.toFixed(2)} km</p>
+          <p><strong>Main direction:</strong> ${getDirectionName(summary.directionDegrees)}</p>
+          <div class="env-data">
+            <h6>Live Environmental Factors:</h6>
+            <p>Wind: ${summary.windSpeedMps.toFixed(1)} m/s ${getDirectionName(summary.windDirectionDegrees)}</p>
+            <p>Temp: ${summary.temperatureC.toFixed(1)}°C, Humidity: ${summary.humidityPercent.toFixed(0)}%</p>
+            <p>Data source: Open-Meteo + Copernicus GLO-90</p>
+          </div>
+        </div>
+      </div>
+    `;
+    
+    const popup = new mapboxgl.Popup()
+      .setLngLat([fireProps.longitude, fireProps.latitude])
+      .setHTML(popupContent)
+      .addTo(map);
+    trackPopup(popup);
+  };
+
+  // 4) Create sources/layers + click handler
+  const setupLayers = () => {
+    const map = mapRef.current;
+    if (!map) return;
+
+    // Wildfires layer
+    if (map.getLayer('wildfires-layer'))  map.removeLayer('wildfires-layer');
+    if (map.getSource('wildfires-source')) map.removeSource('wildfires-source');
+    map.addSource('wildfires-source', {
+      type: 'geojson',
+      data: { type: 'FeatureCollection', features: [] }
+    });
+    map.addLayer({
+      id: 'wildfires-layer',
+      type: 'circle',
+      source: 'wildfires-source',
+      paint: {
+        'circle-radius':       4,
+        'circle-color': [
+          'match', ['get', 'status'],
+          'confirmed_wildfire', '#d7191c',
+          'satellite_detected_active_fire', '#ff7f00',
+          'unverified_thermal_anomaly', '#f6c344',
+          'reported_incident_no_recent_satellite_detection', '#2c7bb6',
+          '#777777'
+        ],
+        'circle-stroke-width': 1,
+        'circle-stroke-color': '#fff'
+      }
+    });
+
+    // Click handler for popups
+    if (clickHandlerRef.current) {
+      map.off('click','wildfires-layer', clickHandlerRef.current);
+    }
+    clickHandlerRef.current = async e => {
+      const f = e.features[0];
+      if (!f) return;
+      const {
+        brightnessCat, confidenceRaw, timestamp, brightness, status, incidentName,
+        observationCount, sources, incidentSizeAcres, percentContained,
+        hasOfficialPerimeter, officialIncidentId, representativeLatitude, representativeLongitude,
+        clusterCoordinates
+      } = f.properties;
+      const coords = f.geometry.coordinates;
+      const timeStr = timestamp
+        ? new Date(timestamp).toLocaleString()
+        : 'Unknown';
+
+      // raw percent for the popup
+      closeActivePopup();
+      removeDetectionPerimeter();
+
+      const pct = confidenceToPercent(confidenceRaw);
+      const address = await reverseGeocode(coords[1], coords[0], mapboxgl.accessToken);
+      const icon    = getSeverityIcon(brightnessCat);
+      const hasObservation = Number(observationCount) > 0;
+      const eventClusterCoordinates = parseClusterCoordinates(clusterCoordinates);
+      const hasOfficialBoundary = hasOfficialPerimeter === true || hasOfficialPerimeter === 'true';
+      const perimeterButtonText = perimeterActionLabel(hasOfficialBoundary);
+      const officialDetails = incidentName
+        ? `<p><strong>Official incident:</strong> ${escapeHtml(incidentName)}</p>
+           <p><strong>Size:</strong> ${incidentSizeAcres ?? 'Unknown'} acres; <strong>contained:</strong> ${percentContained ?? 'Unknown'}%</p>`
+        : '';
+      const satelliteDetails = hasObservation
+        ? `<p><strong>Confidence:</strong> ${pct}%</p>
+           <p><strong>Satellite observations:</strong> ${observationCount} (${escapeHtml(sources)})</p>
+           <p><strong>Last observed:</strong> ${timeStr}</p>`
+        : '<p>No FIRMS observation was found in the current two-day window.</p>';
+
+      // Create fire properties object for prediction
+      const predictionLocation = predictionCoordinates({
+        status,
+        representativeLatitude,
+        representativeLongitude
+      }, coords);
+      const fireProps = {
+        brightnessCat,
+        brightness,
+        ...predictionLocation
+      };
+
+      const popup = new mapboxgl.Popup()
+        .setLngLat(coords)
+        .setHTML(`
+          <div class="wildfire-popup">
+            <h4>${icon} ${detectionStatusLabel(status)}</h4>
+            <p><strong>Address:</strong> ${address}</p>
+            ${officialDetails}
+            ${satelliteDetails}
+            ${canShowPerimeter(eventClusterCoordinates, hasOfficialBoundary) ? `${!hasOfficialBoundary ? `<p class="perimeter-note">
+              No official WFIGS perimeter is available. This draws an estimated footprint around the recent satellite detections.
+            </p>` : ''}<button id="show-current-perimeter-btn" class="perimeter-btn" data-default-label="${perimeterButtonText}">
+              ${perimeterButtonText}
+            </button>
+            <p class="perimeter-error" data-perimeter-error></p>` : ''}
+            ${hasObservation ? `<button id="predict-spread-btn" class="predict-spread-btn">
+              ${isPredicting ? 'Predicting...' : 'Predict Fire Spread'}
+            </button>` : ''}
+          </div>
+        `)
+        .addTo(map);
+      
+      trackPopup(popup);
+
+      const perimeterBtn = document.getElementById('show-current-perimeter-btn');
+      if (perimeterBtn) {
+        perimeterBtn.addEventListener('click', () =>
+          handleShowCurrentPerimeter(eventClusterCoordinates, officialIncidentId, perimeterBtn));
+      }
+      
+      // Add event listener to the predict button
+      const predictBtn = document.getElementById('predict-spread-btn');
+      if (predictBtn) {
+        predictBtn.addEventListener('click', () => handlePredictFireSpread(
+          fireProps, eventClusterCoordinates, officialIncidentId
+        ));
+      }
+    };
+    map.on('click','wildfires-layer', clickHandlerRef.current);
+
+    // User marker layer
+    if (map.getLayer('user-layer'))  map.removeLayer('user-layer');
+    if (map.getSource('user-source')) map.removeSource('user-source');
+    map.addSource('user-source', {
+      type: 'geojson',
+      data: { type: 'FeatureCollection', features: [] }
+    });
+    map.addLayer({
+      id: 'user-layer',
+      type: 'circle',
+      source: 'user-source',
+      paint: {
+        'circle-radius':       6,
+        'circle-color':        '#1E90FF',
+        'circle-stroke-width': 2,
+        'circle-stroke-color': '#fff'
+      }
+    });
+  };
+
+  // 5) Initialize map once
+  useEffect(() => {
+    const m = new mapboxgl.Map({
+      container: mapContainerRef.current,
+      style:     mapStyle,
+      center:    [-98, 38],
+      zoom:      4,
+      maxBounds: [[-130,22],[-66,50]]
+    });
+    m.addControl(new mapboxgl.NavigationControl());
+    mapRef.current = m;
+
+    m.on('load', () => {
+      setupLayers();
+      fetchWildfires();
+      updateWildfireSource();
+      updateUserSource();
+    });
+    return () => m.remove();
+  }, []);
+
+  // 6) Reapply on style change
+  useEffect(() => {
+    const map = mapRef.current;
+    if (!map) return;
+    map.setStyle(mapStyle);
+    map.once('styledata', () => {
+      setupLayers();
+      updateWildfireSource();
+      updateUserSource();
+    });
+  }, [mapStyle]);
+
+  // 7) Refresh layer when filters/data change
+  useEffect(() => {
+    updateWildfireSource();
+  }, [wildfires, eventTypes, recencyHours, boundaryFilter]);
+
+  // 8) Update user marker
+  useEffect(() => {
+    updateUserSource();
+  }, [userLocation]);
+
+  // 9) Compute & send all in-range fires
+  useEffect(() => {
+    if (!onNearbyFiresUpdate) return;
+    const t = setTimeout(async () => {
+      if (!userLocation || wildfires.length === 0 || range <= 0) {
+        onNearbyFiresUpdate([]);
+        return;
+      }
+      // Use the exact same filtered events and coordinates as the visible map layer.
+      const visibleEvents = filterDetectionEvents(wildfires, {
+        eventTypes,
+        recencyHours,
+        boundaryFilter
+      });
+      const inRange = visibleEvents
+        .map(f => {
+          const [longitude, latitude] = eventMarkerCoordinates(f);
+          const d = haversineDistance(
+            userLocation.lat, userLocation.lng,
+            latitude, longitude
+          );
+          return {
+            ...f,
+            distance:      d,
+            markerLatitude: latitude,
+            markerLongitude: longitude
+          };
+        })
+        .filter(f => f.distance <= range);
+
+      // Reverse-geocode the same coordinate used to draw and measure the marker.
+      const enriched = await Promise.all(
+        inRange.map(async f => {
+          const cityName = await reverseGeocode(
+            f.markerLatitude,
+            f.markerLongitude,
+            mapboxgl.accessToken
+          );
+          return {
+            eventId: f.eventId || f.officialIncidentId || `${f.markerLongitude},${f.markerLatitude}`,
+            cityName,
+            distance:      f.distance,
+            statusLabel: detectionStatusLabel(f.status),
+            incidentName: f.incidentName
+          };
+        })
+      );
+      onNearbyFiresUpdate(enriched);
+    }, 500);
+    return () => clearTimeout(t);
+  }, [userLocation, range, wildfires, eventTypes, recencyHours, boundaryFilter, onNearbyFiresUpdate]);
+
+  // Add CSS for the prediction button and environmental data
+  useEffect(() => {
+    const style = document.createElement('style');
+    style.textContent = `
+      .predict-spread-btn {
+        background-color: #4CAF50;
+        color: white;
+        padding: 8px 12px;
+        border: none;
+        border-radius: 4px;
+        cursor: pointer;
+        margin-top: 10px;
+        width: 100%;
+        font-weight: bold;
+      }
+      .perimeter-btn {
+        background-color: #2563eb;
+        color: white;
+        padding: 8px 12px;
+        border: none;
+        border-radius: 4px;
+        cursor: pointer;
+        margin-top: 10px;
+        width: 100%;
+        font-weight: bold;
+      }
+      .perimeter-btn:hover:not(:disabled) { background-color: #1d4ed8; }
+      .perimeter-btn:disabled { cursor: wait; opacity: 0.75; }
+      .perimeter-error { color: #b91c1c; margin: 6px 0 0; }
+      .perimeter-note { color: #555; font-size: 0.9em; margin: 8px 0 0; }
+      .predict-spread-btn:hover {
+        background-color: #45a049;
+      }
+      .prediction-results {
+        margin-top: 10px;
+        padding-top: 10px;
+        border-top: 1px solid #ddd;
+      }
+      .prediction-results h5 {
+        margin-top: 0;
+        margin-bottom: 8px;
+        color: #FF4500;
+      }
+      .env-data {
+        margin-top: 8px;
+        padding: 8px;
+        background-color: #f8f8f8;
+        border-radius: 4px;
+        font-size: 0.9em;
+      }
+      .env-data h6 {
+        margin: 0 0 5px 0;
+        color: #666;
+      }
+      .env-data p {
+        margin: 3px 0;
+      }
+    `;
+    document.head.appendChild(style);
+    return () => {
+      document.head.removeChild(style);
+    };
+  }, []);
+
+  return (
+    <div
+      ref={mapContainerRef}
+      style={{ width: '100%', height: '100%', position: 'relative' }}
+    />
+  );
+});
+
+export default MapComponent;
