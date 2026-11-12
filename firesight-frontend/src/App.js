@@ -1,11 +1,15 @@
 // src/App.js
-import React, { useCallback, useRef, useState } from 'react';
+import React, { useCallback, useEffect, useRef, useState } from 'react';
 import './App.css';
 import Header from './components/Header';
 import Footer from './components/Footer';
 import MapComponent from './components/MapComponent';
 import FireControls from './components/FireControls';
 import { ALL_EVENT_TYPES } from './components/eventFilters';
+import {
+  loadSavedHomeLocation,
+  saveHomeLocation
+} from './components/evacuation';
 
 function App() {
   const mapRef = useRef(null);
@@ -18,8 +22,12 @@ function App() {
   const [mapStyle, setMapStyle] = useState('mapbox://styles/mapbox/streets-v12');
 
   // user location + range
-  const [userLocation, setUserLocation] = useState(null);
+  const [userLocation, setUserLocation] = useState(loadSavedHomeLocation);
   const [range, setRange] = useState(20);
+
+  useEffect(() => {
+    saveHomeLocation(userLocation);
+  }, [userLocation]);
 
   // store array of nearby fires
   const [nearbyFires, setNearbyFires] = useState([]);

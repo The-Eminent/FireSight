@@ -8,6 +8,39 @@ import { point } from '@turf/helpers';
 
 export const SAFETY_RADIUS_MILES = 10;
 export const SAFE_WAYPOINT_MILES = 15;
+export const HOME_LOCATION_STORAGE_KEY = 'firesight-home-location';
+
+function validHomeLocation(value) {
+  const lat = Number(value?.lat);
+  const lng = Number(value?.lng);
+  return Number.isFinite(lat) && lat >= -90 && lat <= 90 &&
+    Number.isFinite(lng) && lng >= -180 && lng <= 180
+    ? { lat, lng }
+    : null;
+}
+
+export function loadSavedHomeLocation(storage) {
+  try {
+    const target = storage || window.localStorage;
+    return validHomeLocation(JSON.parse(target.getItem(HOME_LOCATION_STORAGE_KEY)));
+  } catch {
+    return null;
+  }
+}
+
+export function saveHomeLocation(location, storage) {
+  try {
+    const target = storage || window.localStorage;
+    const validLocation = validHomeLocation(location);
+    if (validLocation) {
+      target.setItem(HOME_LOCATION_STORAGE_KEY, JSON.stringify(validLocation));
+    } else {
+      target.removeItem(HOME_LOCATION_STORAGE_KEY);
+    }
+  } catch {
+    // Storage can be unavailable in private/restricted browser contexts.
+  }
+}
 
 function homePoint(location) {
   return point([Number(location.lng), Number(location.lat)]);
@@ -38,6 +71,14 @@ export function proximityAlert(location, currentBoundaries = [], prediction = nu
   return currentBoundaries.some(boundary => intersects(radius, boundary))
     ? 'nearby'
     : null;
+}
+
+export function intersectingBoundaryKeys(location, boundaryRecords = []) {
+  const radius = safetyCircle(location);
+  if (!radius) return [];
+  return boundaryRecords
+    .filter(record => record?.key && intersects(radius, record.boundary))
+    .map(record => String(record.key));
 }
 
 export function calculateSafeWaypoint(location, prediction) {

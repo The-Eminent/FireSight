@@ -1,7 +1,11 @@
 import { polygon } from '@turf/helpers';
 import {
   calculateSafeWaypoint,
+  HOME_LOCATION_STORAGE_KEY,
+  intersectingBoundaryKeys,
+  loadSavedHomeLocation,
   proximityAlert,
+  saveHomeLocation,
   safetyCircle
 } from './evacuation';
 
@@ -29,4 +33,33 @@ test('safe waypoint continues from the fire through the user location', () => {
   expect(waypoint.bearing).toBeCloseTo(90, 0);
   expect(waypoint.lng).toBeGreaterThan(0);
   expect(Math.abs(waypoint.lat)).toBeLessThan(0.01);
+});
+
+test('returns only event keys whose boundaries intersect the safety radius', () => {
+  const records = [
+    { key: 'near-fire', boundary: nearby },
+    { key: 'far-fire', boundary: distant }
+  ];
+
+  expect(intersectingBoundaryKeys(home, records)).toEqual(['near-fire']);
+  expect(intersectingBoundaryKeys(null, records)).toEqual([]);
+});
+
+test('persists, restores and clears a valid home location', () => {
+  const values = new Map();
+  const storage = {
+    getItem: key => values.get(key) ?? null,
+    setItem: (key, value) => values.set(key, value),
+    removeItem: key => values.delete(key)
+  };
+
+  saveHomeLocation({ lat: 34.05, lng: -118.25 }, storage);
+  expect(loadSavedHomeLocation(storage)).toEqual({ lat: 34.05, lng: -118.25 });
+  saveHomeLocation(null, storage);
+  expect(values.has(HOME_LOCATION_STORAGE_KEY)).toBe(false);
+});
+
+test('rejects invalid persisted home coordinates', () => {
+  const storage = { getItem: () => '{"lat":120,"lng":-118}' };
+  expect(loadSavedHomeLocation(storage)).toBeNull();
 });

@@ -32,6 +32,7 @@ import { predictionErrorMessage, predictionSummary } from './prediction';
 import {
   calculateSafeWaypoint,
   featureBounds,
+  intersectingBoundaryKeys,
   proximityAlert,
   safetyCircle
 } from './evacuation';
@@ -44,6 +45,7 @@ const PERIMETER_LINE_LAYER = 'current-fire-perimeter-line';
 const SAFETY_SOURCE = 'home-safety-radius';
 const ROUTE_SOURCE = 'evacuation-route';
 const BOUNDARY_CANDIDATE_MILES = 30;
+const FIRE_POLL_INTERVAL_MS = 5 * 60 * 1000;
 
 // Helpers
 function getBrightnessCategory(b) {
@@ -120,12 +122,19 @@ const MapComponent = forwardRef(({
   const nearbyBoundariesRef = useRef([]);
   const boundaryCacheRef = useRef(new Map());
   const boundaryRequestRef = useRef(0);
+  const fetchWildfiresRef = useRef(null);
+  const notifiedEventKeysRef = useRef(new Set());
+  const predictionNotificationSentRef = useRef(false);
   const locationChangeRef = useRef(onUserLocationChange);
   const [wildfires, setWildfires] = useState([]);
   const [alertTier, setAlertTier] = useState(null);
   const [isPlacingHome, setIsPlacingHome] = useState(false);
   const [isRouting, setIsRouting] = useState(false);
   const [routeError, setRouteError] = useState('');
+  const [notificationPermission, setNotificationPermission] = useState(() => {
+    if (typeof window === 'undefined' || !('Notification' in window)) return 'unsupported';
+    return window.Notification.permission;
+  });
   homeLocationRef.current = userLocation;
   locationChangeRef.current = onUserLocationChange;
 
@@ -144,17 +153,70 @@ const MapComponent = forwardRef(({
     if (map.getSource(ROUTE_SOURCE)) map.removeSource(ROUTE_SOURCE);
   };
 
+  const notifySafetyThreats = (
+    location = homeLocationRef.current,
+    boundaryRecords = nearbyBoundariesRef.current,
+    prediction = currentPredictionRef.current
+  ) => {
+    if (
+      !location || !('Notification' in window) ||
+      window.Notification.permission !== 'granted'
+    ) return;
+    intersectingBoundaryKeys(location, boundaryRecords).forEach(key => {
+      if (notifiedEventKeysRef.current.has(key)) return;
+      const record = boundaryRecords.find(item => String(item.key) === key);
+      try {
+        new window.Notification('FireSight: Active Fire Nearby', {
+          body: `${record?.label || 'An active fire'} is within your 10-mile safety radius.`,
+          tag: `firesight-current-${key}`
+        });
+        notifiedEventKeysRef.current.add(key);
+      } catch (error) {
+        console.error('Unable to show browser notification:', error);
+      }
+    });
+    if (
+      !predictionNotificationSentRef.current &&
+      proximityAlert(location, [], prediction) === 'evacuation'
+    ) {
+      try {
+        new window.Notification('FireSight: Evacuation Warning', {
+          body: 'Predicted 24-hour fire spread has breached your 10-mile safety radius.',
+          tag: 'firesight-predicted-spread'
+        });
+        predictionNotificationSentRef.current = true;
+      } catch (error) {
+        console.error('Unable to show browser notification:', error);
+      }
+    }
+  };
+
   const updateProximityAlert = (
     location = homeLocationRef.current,
     boundaries = nearbyBoundariesRef.current,
     prediction = currentPredictionRef.current
   ) => {
+    const boundaryFeatures = boundaries.map(record => record.boundary || record);
     const activeBoundaries = currentPerimeterRef.current
-      ? [currentPerimeterRef.current, ...boundaries]
-      : boundaries;
+      ? [currentPerimeterRef.current, ...boundaryFeatures]
+      : boundaryFeatures;
     const nextTier = proximityAlert(location, activeBoundaries, prediction);
     setAlertTier(nextTier);
     if (nextTier !== 'evacuation') removeEvacuationRoute();
+    notifySafetyThreats(location, boundaries, prediction);
+  };
+
+  const requestDesktopNotifications = async () => {
+    if (!('Notification' in window)) return;
+    const permission = await window.Notification.requestPermission();
+    setNotificationPermission(permission);
+    if (permission === 'granted') {
+      notifySafetyThreats(
+        homeLocationRef.current,
+        nearbyBoundariesRef.current,
+        currentPredictionRef.current
+      );
+    }
   };
 
   const updateSafetyRadius = (location = homeLocationRef.current) => {
@@ -259,6 +321,7 @@ const MapComponent = forwardRef(({
       setIsFetching(false);
     }
   };
+  fetchWildfiresRef.current = fetchWildfires;
   useImperativeHandle(ref, () => ({
     refreshWildfires: () => fetchWildfires(true)
   }), []);
@@ -450,6 +513,7 @@ const MapComponent = forwardRef(({
       }
     });
     currentPredictionRef.current = prediction;
+    predictionNotificationSentRef.current = false;
     updateProximityAlert(homeLocationRef.current, nearbyBoundariesRef.current, prediction);
 
     const bounds = geoJsonBounds(prediction);
@@ -668,7 +732,10 @@ const MapComponent = forwardRef(({
     });
     return () => {
       homeMarkerRef.current?.remove();
+      homeMarkerRef.current = null;
       safeZoneMarkerRef.current?.remove();
+      safeZoneMarkerRef.current = null;
+      mapRef.current = null;
       m.remove();
     };
   }, []);
@@ -691,8 +758,18 @@ const MapComponent = forwardRef(({
     updateWildfireSource();
   }, [wildfires, eventTypes, recencyHours, boundaryFilter]);
 
+  // Keep the browser view current while the backend refreshes its DB snapshot.
+  useEffect(() => {
+    const poll = window.setInterval(
+      () => fetchWildfiresRef.current?.(), FIRE_POLL_INTERVAL_MS
+    );
+    return () => window.clearInterval(poll);
+  }, []);
+
   // 8) Update the draggable home marker, radius and alert.
   useEffect(() => {
+    notifiedEventKeysRef.current.clear();
+    predictionNotificationSentRef.current = false;
     removeEvacuationRoute();
     setRouteError('');
     updateSafetyRadius(userLocation);
@@ -735,13 +812,24 @@ const MapComponent = forwardRef(({
       });
       const settled = await Promise.allSettled(candidates.map(async event => {
         const key = event.eventId || event.officialIncidentId || JSON.stringify(event.cluster_coordinates);
-        if (boundaryCacheRef.current.has(key)) return boundaryCacheRef.current.get(key);
+        const cacheKey = `${key}:${event.timestamp || event.lastObservedAt || ''}`;
+        if (boundaryCacheRef.current.has(cacheKey)) {
+          return {
+            key,
+            label: event.incidentName || detectionStatusLabel(event.status),
+            boundary: boundaryCacheRef.current.get(cacheKey)
+          };
+        }
         const boundary = await getDetectionPolygon({
           clusterCoordinates: parseClusterCoordinates(event.cluster_coordinates),
           officialIncidentId: event.officialIncidentId
         });
-        boundaryCacheRef.current.set(key, boundary);
-        return boundary;
+        boundaryCacheRef.current.set(cacheKey, boundary);
+        return {
+          key,
+          label: event.incidentName || detectionStatusLabel(event.status),
+          boundary
+        };
       }));
       if (requestId !== boundaryRequestRef.current) return;
       nearbyBoundariesRef.current = settled
@@ -924,6 +1012,8 @@ const MapComponent = forwardRef(({
             onClick={() => {
               setIsPlacingHome(false);
               nearbyBoundariesRef.current = [];
+              notifiedEventKeysRef.current.clear();
+              predictionNotificationSentRef.current = false;
               setAlertTier(null);
               removeEvacuationRoute();
               locationChangeRef.current?.(null);
@@ -932,6 +1022,23 @@ const MapComponent = forwardRef(({
             Clear Home &amp; Route
           </button>
         )}
+        <button
+          style={{
+            ...styles.homeButton,
+            ...styles.notificationButton,
+            ...(notificationPermission === 'granted' ? styles.notificationEnabled : {})
+          }}
+          onClick={requestDesktopNotifications}
+          disabled={notificationPermission !== 'default'}
+          title={notificationPermission === 'denied'
+            ? 'Notifications are blocked in this browser. Change the site permission to enable them.'
+            : undefined}
+        >
+          {notificationPermission === 'granted' && 'Desktop Alerts On'}
+          {notificationPermission === 'default' && 'Enable Desktop Alerts'}
+          {notificationPermission === 'denied' && 'Desktop Alerts Blocked'}
+          {notificationPermission === 'unsupported' && 'Desktop Alerts Unsupported'}
+        </button>
       </div>
 
       {alertTier && (
@@ -986,6 +1093,8 @@ const styles = {
     boxShadow: '0 2px 6px rgba(0,0,0,0.3)'
   },
   clearButton: { background: '#475569' },
+  notificationButton: { background: '#7c3aed' },
+  notificationEnabled: { background: '#15803d', cursor: 'default' },
   alertPosition: {
     position: 'absolute',
     top: 16,
