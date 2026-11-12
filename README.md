@@ -55,8 +55,8 @@ React/Mapbox event map
 ## Repository layout
 
 ```text
-ignis-ai-frontend/          React map, controls, perimeter and prediction UI
-ignis-ai-backend/
+firesight-frontend/          React map, controls, perimeter and prediction UI
+firesight-backend/
   models/                   MongoDB/Mongoose schemas
   routes/                   Public Express endpoints
   services/                 Ingestion, matching, clustering and persistence
@@ -90,7 +90,7 @@ cd FireSight
 Install backend and Python dependencies:
 
 ```bash
-cd ignis-ai-backend
+cd firesight-backend
 npm install
 python3.11 -m venv ml/venv
 ml/venv/bin/pip install -r ml/requirements-detection.txt \
@@ -98,12 +98,12 @@ ml/venv/bin/pip install -r ml/requirements-detection.txt \
 cp .env.example .env
 ```
 
-Edit `ignis-ai-backend/.env`:
+Edit `firesight-backend/.env`:
 
 ```dotenv
 PORT=5001
 PREDICTION_SERVICE_URL=http://127.0.0.1:8000
-MONGODB_URI=mongodb://localhost:27017/ignis_ai
+MONGODB_URI=mongodb://localhost:27017/firesight
 NASA_API_KEY=your_firms_key
 MAPBOX_ACCESS_TOKEN=<your-public-mapbox-token>
 PYTHON_COMMAND=./ml/venv/bin/python
@@ -112,11 +112,11 @@ PYTHON_COMMAND=./ml/venv/bin/python
 Install and configure the frontend:
 
 ```bash
-cd ../ignis-ai-frontend
+cd ../firesight-frontend
 npm install
 ```
 
-Create `ignis-ai-frontend/.env`:
+Create `firesight-frontend/.env`:
 
 ```dotenv
 REACT_APP_MAPBOX_TOKEN=<your-public-mapbox-token>
@@ -126,7 +126,7 @@ REACT_APP_API_BASE_URL=http://localhost:5001/api
 Never put a Mapbox secret token beginning with `sk.` in frontend code. Both
 local `.env` files are ignored by Git.
 
-Initialize MongoDB indexes from `ignis-ai-backend/`:
+Initialize MongoDB indexes from `firesight-backend/`:
 
 ```bash
 npm run db:migrate-geo
@@ -152,14 +152,14 @@ Press `Ctrl+C` once to stop FastAPI, Express and React together. To run the
 services separately for debugging, use the individual commands below.
 
 ```bash
-# Terminal 1 — ignis-ai-backend/
+# Terminal 1 — firesight-backend/
 ml/venv/bin/uvicorn inference_api:app --app-dir ml \
   --host 127.0.0.1 --port 8000
 
-# Terminal 2 — ignis-ai-backend/
+# Terminal 2 — firesight-backend/
 npm start
 
-# Terminal 3 — ignis-ai-frontend/
+# Terminal 3 — firesight-frontend/
 npm start
 ```
 
@@ -180,13 +180,13 @@ The backend refresh worker runs on startup and every 15 minutes by default.
 
 ```bash
 # Backend
-cd ignis-ai-backend && npm test
+cd firesight-backend && npm test
 
 # Python ML/geospatial tests
-cd ignis-ai-backend/ml && venv/bin/python -m unittest -v
+cd firesight-backend/ml && venv/bin/python -m unittest -v
 
 # Focused frontend tests and production build
-cd ignis-ai-frontend
+cd firesight-frontend
 CI=true npm test -- --watchman=false --runInBand src/components
 npm run build
 ```

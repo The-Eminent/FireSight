@@ -17,8 +17,8 @@ venv/
 # Raw training data and generated ML tables
 *.tfrecord
 *.tfrecords
-ignis-ai-backend/data/ndws_tfrecords/
-ignis-ai-backend/data/processed/
+firesight-backend/data/ndws_tfrecords/
+firesight-backend/data/processed/
 *.npy
 *.npz
 
