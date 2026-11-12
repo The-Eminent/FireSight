@@ -23,6 +23,12 @@ demand, and sends that boundary through a physics-informed XGBoost model.
   estimated footprint from the satellite cluster.
 - Predicts a 24-hour boundary using Fuel Model 4 Rothermel physics plus an
   XGBoost classifier/regressor hurdle model.
+- Expands prediction vertices along local outward boundary directions, builds
+  swept growth areas, and preserves the original fire area in the result.
+- Stores an optional Home pin in browser-local storage and checks a 10-mile
+  safety radius against current and predicted fire boundaries.
+- Provides opt-in desktop notifications while FireSight is open and can draw a
+  Mapbox evacuation route toward a dynamically calculated safer waypoint.
 
 ## Architecture
 
@@ -42,6 +48,8 @@ React/Mapbox event map
           |
           +--> Express prediction proxy --> FastAPI --> XGBoost + Open-Meteo
                                                     --> predicted GeoJSON
+          |
+          +--> Home safety radius --> browser alerts --> evacuation route
 ```
 
 | Layer | Technology |
@@ -212,6 +220,17 @@ stencil, and uses local polygon area as an explicit proxy for the unavailable
 and median fallbacks for features unavailable from Open-Meteo. Estimated
 satellite footprints represent recent thermal-observation geometry, not an
 official burned-area perimeter.
+
+The prediction geometry is generated from local outward boundary directions
+with bounded wind and terrain influence. Neighboring displacement changes are
+smoothed, swept edge areas are merged with the original polygon, and Shapely
+repairs and validates the final GeoJSON. The result is a potential 24-hour
+spread footprint, not an operational evacuation perimeter.
+
+Desktop notifications are browser-local and work only while FireSight remains
+open. The calculated evacuation route is a demonstration route toward a point
+away from the predicted fire. It does not use official shelters, road closures,
+traffic conditions, or emergency-agency evacuation orders.
 
 ## Data sources
 
