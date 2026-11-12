@@ -10,6 +10,18 @@ export const SAFETY_RADIUS_MILES = 10;
 export const SAFE_WAYPOINT_MILES = 15;
 export const HOME_LOCATION_STORAGE_KEY = 'firesight-home-location';
 
+export function notificationButtonLabel(permission) {
+  if (permission === 'granted') return 'Desktop Notifications Allowed';
+  if (permission === 'unsupported') return 'Desktop Notifications Unavailable';
+  return 'Get Desktop Notifications';
+}
+
+export function notificationPermissionAction(permission) {
+  if (permission === 'denied') return 'help';
+  if (permission === 'default') return 'request';
+  return 'none';
+}
+
 function validHomeLocation(value) {
   const lat = Number(value?.lat);
   const lng = Number(value?.lng);

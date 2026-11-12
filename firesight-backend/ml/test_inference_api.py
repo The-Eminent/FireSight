@@ -1,15 +1,18 @@
 import unittest
 
 import numpy as np
-from shapely.geometry import Polygon, shape
+from shapely.geometry import MultiPolygon, Polygon, shape
 
 from inference_api import (
     INFERENCE_FEATURE_COLUMNS,
     LiveWeather,
     PredictionService,
+    _build_swept_prediction,
     _live_geometry_features,
     _polygon_rings,
+    _ring_hole_flags,
     _segmentize_metric_geometry,
+    _spread_directions,
     specific_humidity,
     utm_crs,
 )
@@ -134,6 +137,74 @@ class InferenceServiceTest(unittest.TestCase):
             )
 
         self.assertLessEqual(max(lengths), 100.0 + 1e-9)
+
+    def test_swept_growth_expands_local_fronts_instead_of_one_parallel_corridor(self):
+        current = Polygon([
+            (0.0, 0.0), (1_000.0, 0.0),
+            (1_000.0, 1_000.0), (0.0, 1_000.0),
+        ])
+        rings = _polygon_rings(current)
+        predicted = _build_swept_prediction(
+            current, rings, _ring_hole_flags(current),
+            np.full(4, 2_000.0), 90.0,
+        )
+
+        self.assertTrue(predicted.is_valid)
+        self.assertTrue(predicted.buffer(1e-9).covers(current))
+        west, south, east, north = predicted.bounds
+        self.assertLess(west, -1_000.0)
+        self.assertLess(south, -1_000.0)
+        self.assertGreater(east, 2_000.0)
+        self.assertGreater(north, 2_000.0)
+
+    def test_heading_bias_never_turns_a_vertex_inward(self):
+        normals = np.asarray([
+            [1.0, 0.0], [-1.0, 0.0], [0.0, 1.0], [0.0, -1.0]
+        ])
+        directions = _spread_directions(normals, 90.0)
+
+        self.assertTrue(np.all(np.sum(normals * directions, axis=1) > 0.0))
+        self.assertGreater(directions[2, 0], 0.0)
+        self.assertGreater(directions[3, 0], 0.0)
+
+    def test_swept_growth_repairs_concave_uneven_front(self):
+        current = Polygon([
+            (0.0, 0.0), (4_000.0, 0.0), (4_000.0, 4_000.0),
+            (3_000.0, 4_000.0), (3_000.0, 1_000.0),
+            (1_000.0, 1_000.0), (1_000.0, 4_000.0), (0.0, 4_000.0),
+        ])
+        rings = _polygon_rings(current)
+        predicted = _build_swept_prediction(
+            current, rings, _ring_hole_flags(current),
+            np.asarray([0.0, 3_000.0, 500.0, 0.0, 2_500.0, 0.0, 1_000.0, 0.0]),
+            315.0,
+        )
+
+        self.assertTrue(predicted.is_valid)
+        self.assertIn(predicted.geom_type, {"Polygon", "MultiPolygon"})
+        self.assertTrue(predicted.buffer(1e-9).covers(current))
+        self.assertTrue(current.buffer(3_100.0).covers(predicted))
+
+    def test_swept_growth_supports_multipolygons_and_holes(self):
+        donut = Polygon(
+            [(0.0, 0.0), (2_000.0, 0.0), (2_000.0, 2_000.0), (0.0, 2_000.0)],
+            [[(700.0, 700.0), (1_300.0, 700.0),
+              (1_300.0, 1_300.0), (700.0, 1_300.0)]],
+        )
+        current = MultiPolygon([
+            donut,
+            Polygon([(4_000.0, 0.0), (5_000.0, 0.0),
+                     (5_000.0, 1_000.0), (4_000.0, 1_000.0)]),
+        ])
+        rings = _polygon_rings(current)
+        distances = np.linspace(0.0, 1_000.0, sum(map(len, rings)))
+        predicted = _build_swept_prediction(
+            current, rings, _ring_hole_flags(current), distances, 180.0,
+        )
+
+        self.assertTrue(predicted.is_valid)
+        self.assertTrue(predicted.buffer(1e-9).covers(current))
+        self.assertIn(predicted.geom_type, {"Polygon", "MultiPolygon"})
 
 
 if __name__ == "__main__":

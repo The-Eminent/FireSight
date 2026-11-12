@@ -13,7 +13,7 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
-// TODO: restore production origin support before next Render deploy — see PROJECT_MAP.md.
+// TODO: restore production origin support before next Render deploy - see PROJECT_MAP.md.
 // app.use(cors({
 //   origin: process.env.FRONTEND_ORIGIN
 // }));

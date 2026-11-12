@@ -33,6 +33,8 @@ import {
   calculateSafeWaypoint,
   featureBounds,
   intersectingBoundaryKeys,
+  notificationButtonLabel,
+  notificationPermissionAction,
   proximityAlert,
   safetyCircle
 } from './evacuation';
@@ -131,12 +133,41 @@ const MapComponent = forwardRef(({
   const [isPlacingHome, setIsPlacingHome] = useState(false);
   const [isRouting, setIsRouting] = useState(false);
   const [routeError, setRouteError] = useState('');
+  const [showNotificationHelp, setShowNotificationHelp] = useState(false);
   const [notificationPermission, setNotificationPermission] = useState(() => {
     if (typeof window === 'undefined' || !('Notification' in window)) return 'unsupported';
     return window.Notification.permission;
   });
   homeLocationRef.current = userLocation;
   locationChangeRef.current = onUserLocationChange;
+
+  useEffect(() => {
+    const syncPermission = () => {
+      const permission = 'Notification' in window
+        ? window.Notification.permission
+        : 'unsupported';
+      setNotificationPermission(permission);
+      if (permission !== 'denied') setShowNotificationHelp(false);
+    };
+    let permissionStatus;
+    let cancelled = false;
+
+    window.addEventListener('focus', syncPermission);
+    document.addEventListener('visibilitychange', syncPermission);
+    navigator.permissions?.query({ name: 'notifications' }).then(status => {
+      if (cancelled) return;
+      permissionStatus = status;
+      permissionStatus.addEventListener?.('change', syncPermission);
+      syncPermission();
+    }).catch(() => {});
+
+    return () => {
+      cancelled = true;
+      window.removeEventListener('focus', syncPermission);
+      document.removeEventListener('visibilitychange', syncPermission);
+      permissionStatus?.removeEventListener?.('change', syncPermission);
+    };
+  }, []);
 
   const emptyFeatureCollection = () => ({
     type: 'FeatureCollection',
@@ -208,8 +239,15 @@ const MapComponent = forwardRef(({
 
   const requestDesktopNotifications = async () => {
     if (!('Notification' in window)) return;
+    const action = notificationPermissionAction(window.Notification.permission);
+    if (action === 'help') {
+      setShowNotificationHelp(true);
+      return;
+    }
+    if (action !== 'request') return;
     const permission = await window.Notification.requestPermission();
     setNotificationPermission(permission);
+    setShowNotificationHelp(permission === 'denied');
     if (permission === 'granted') {
       notifySafetyThreats(
         homeLocationRef.current,
@@ -236,7 +274,7 @@ const MapComponent = forwardRef(({
     if (!homeMarkerRef.current) {
       const element = document.createElement('div');
       element.textContent = '🏠';
-      element.title = 'User/Home — drag to move';
+      element.title = 'User/Home - drag to move';
       Object.assign(element.style, {
         fontSize: '26px', cursor: 'grab', filter: 'drop-shadow(0 1px 2px white)'
       });
@@ -1029,16 +1067,29 @@ const MapComponent = forwardRef(({
             ...(notificationPermission === 'granted' ? styles.notificationEnabled : {})
           }}
           onClick={requestDesktopNotifications}
-          disabled={notificationPermission !== 'default'}
+          disabled={notificationPermission === 'granted' || notificationPermission === 'unsupported'}
           title={notificationPermission === 'denied'
-            ? 'Notifications are blocked in this browser. Change the site permission to enable them.'
+            ? 'Allow notifications in your browser site settings, then return to FireSight.'
             : undefined}
         >
-          {notificationPermission === 'granted' && 'Desktop Alerts On'}
-          {notificationPermission === 'default' && 'Enable Desktop Alerts'}
-          {notificationPermission === 'denied' && 'Desktop Alerts Blocked'}
-          {notificationPermission === 'unsupported' && 'Desktop Alerts Unsupported'}
+          {notificationButtonLabel(notificationPermission)}
         </button>
+        {showNotificationHelp && (
+          <div role="alert" style={styles.notificationHelp}>
+            <button
+              aria-label="Close notification help"
+              style={styles.notificationHelpClose}
+              onClick={() => setShowNotificationHelp(false)}
+            >
+              ×
+            </button>
+            <strong>Notifications are blocked.</strong>
+            <div>
+              Open the site controls beside the browser address, set Notifications
+              to Allow, then return to FireSight.
+            </div>
+          </div>
+        )}
       </div>
 
       {alertTier && (
@@ -1095,6 +1146,29 @@ const styles = {
   clearButton: { background: '#475569' },
   notificationButton: { background: '#7c3aed' },
   notificationEnabled: { background: '#15803d', cursor: 'default' },
+  notificationHelp: {
+    position: 'relative',
+    width: 260,
+    boxSizing: 'border-box',
+    padding: '12px 30px 12px 12px',
+    border: '1px solid #c4b5fd',
+    borderRadius: 6,
+    background: 'white',
+    color: '#312e81',
+    fontSize: '0.82rem',
+    lineHeight: 1.4,
+    boxShadow: '0 3px 12px rgba(0,0,0,0.3)'
+  },
+  notificationHelpClose: {
+    position: 'absolute',
+    top: 3,
+    right: 6,
+    border: 0,
+    background: 'transparent',
+    color: '#312e81',
+    fontSize: '1.2rem',
+    cursor: 'pointer'
+  },
   alertPosition: {
     position: 'absolute',
     top: 16,

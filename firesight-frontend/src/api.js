@@ -1,10 +1,10 @@
 import axios from 'axios';
 
-// ——— OLD (local-only) config ———
+// --- OLD (local-only) config ---
 // const api = axios.create({
 //   baseURL: 'http://localhost:5000/api',
 // });
-// ————————————————————————————
+// ----------------------------
 
 /**
  * In production we’ll read REACT_APP_API_BASE_URL (e.g.

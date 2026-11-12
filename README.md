@@ -152,14 +152,14 @@ Press `Ctrl+C` once to stop FastAPI, Express and React together. To run the
 services separately for debugging, use the individual commands below.
 
 ```bash
-# Terminal 1 — firesight-backend/
+# Terminal 1 - firesight-backend/
 ml/venv/bin/uvicorn inference_api:app --app-dir ml \
   --host 127.0.0.1 --port 8000
 
-# Terminal 2 — firesight-backend/
+# Terminal 2 - firesight-backend/
 npm start
 
-# Terminal 3 — firesight-frontend/
+# Terminal 3 - firesight-frontend/
 npm start
 ```
 
@@ -215,10 +215,10 @@ official burned-area perimeter.
 
 ## Data sources
 
-- NASA FIRMS — NOAA-20/NOAA-21 VIIRS active-fire observations
-- NIFC WFIGS — official incident locations, acreage, containment and perimeters
-- US Census TIGERweb — urban-area context
-- EPA GHGRP and EOG VIIRS flare catalogs — industrial heat-source exclusions
-- Open-Meteo and Copernicus GLO-90 — live weather and elevation
-- Next Day Wildfire Spread dataset — model training
+- NASA FIRMS - NOAA-20/NOAA-21 VIIRS active-fire observations
+- NIFC WFIGS - official incident locations, acreage, containment and perimeters
+- US Census TIGERweb - urban-area context
+- EPA GHGRP and EOG VIIRS flare catalogs - industrial heat-source exclusions
+- Open-Meteo and Copernicus GLO-90 - live weather and elevation
+- Next Day Wildfire Spread dataset - model training
 

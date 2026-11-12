@@ -290,7 +290,7 @@ function FireControls({
                       <br />
                       <span style={{ color: 'darkblue' }}>
                         {f.statusLabel}
-                        {f.incidentName ? ` — ${f.incidentName}` : ''}
+                        {f.incidentName ? ` - ${f.incidentName}` : ''}
                       </span>
                     </li>
                   ))}

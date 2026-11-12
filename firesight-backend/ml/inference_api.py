@@ -16,7 +16,8 @@ import requests
 from fastapi import FastAPI, HTTPException, Request
 from pydantic import BaseModel, Field
 from pyproj import CRS, Transformer
-from shapely.geometry import MultiPoint, MultiPolygon, Polygon, box, mapping, shape
+from shapely import make_valid
+from shapely.geometry import MultiPolygon, Polygon, box, mapping, shape
 from shapely.ops import transform, unary_union
 from xgboost import XGBClassifier, XGBRegressor
 
@@ -29,6 +30,9 @@ MAX_SPREAD_METERS = 10_000.0
 MAX_SEGMENT_LENGTH_METERS = 100.0
 NDWS_PIXEL_METERS = 1_000.0
 DENSITY_HALF_WINDOW_METERS = 3_500.0
+# atan(0.35) is a maximum ~19-degree along-front deflection; outward growth
+# remains dominant while the Rothermel wind/terrain heading still affects shape.
+PHYSICS_TANGENT_BIAS = 0.35
 INFERENCE_FEATURE_COLUMNS = (
     "elevation", "vs", "wind_from_sin", "wind_from_cos", "tmmn", "tmmx",
     "sph", "pr", "pdsi", "NDVI", "population", "erc",
@@ -155,6 +159,32 @@ def _segmentize_metric_geometry(
     return segmentized
 
 
+def _ring_outward_normals(
+    rings: list[list[tuple[float, float]]], holes: list[bool],
+) -> np.ndarray:
+    """Return one unit outward normal per ring vertex in flattened ring order."""
+    normals: list[tuple[float, float]] = []
+    for ring, is_hole in zip(rings, holes):
+        area_twice = sum(
+            ring[index][0] * ring[(index + 1) % len(ring)][1]
+            - ring[(index + 1) % len(ring)][0] * ring[index][1]
+            for index in range(len(ring))
+        )
+        orientation = 1.0 if area_twice >= 0.0 else -1.0
+        outward_sign = -orientation if is_hole else orientation
+        for index in range(len(ring)):
+            previous, following = ring[index - 1], ring[(index + 1) % len(ring)]
+            tangent_east = following[0] - previous[0]
+            tangent_north = following[1] - previous[1]
+            normal = np.asarray([
+                outward_sign * tangent_north,
+                -outward_sign * tangent_east,
+            ], dtype=float)
+            length = np.linalg.norm(normal)
+            normals.append(tuple(normal / length) if length else (0.0, 0.0))
+    return np.asarray(normals, dtype=float)
+
+
 def _live_geometry_features(
     geometry: Polygon | MultiPolygon,
     rings: list[list[tuple[float, float]]],
@@ -164,26 +194,14 @@ def _live_geometry_features(
     """Approximate NDWS raster geometry features from a metric live polygon."""
     downwind = radians((wind_from_degrees + 180.0) % 360.0)
     wind_east, wind_north = sin(downwind), cos(downwind)
+    normals = _ring_outward_normals(rings, holes)
     alignments, densities = [], []
-    for ring, is_hole in zip(rings, holes):
-        area_twice = sum(
-            ring[index][0] * ring[(index + 1) % len(ring)][1]
-            - ring[(index + 1) % len(ring)][0] * ring[index][1]
-            for index in range(len(ring))
-        )
-        orientation = 1.0 if area_twice >= 0.0 else -1.0
-        outward_sign = -orientation if is_hole else orientation
-        for index, (east, north) in enumerate(ring):
-            previous, following = ring[index - 1], ring[(index + 1) % len(ring)]
-            tangent_east = following[0] - previous[0]
-            tangent_north = following[1] - previous[1]
-            normal_east = outward_sign * tangent_north
-            normal_north = -outward_sign * tangent_east
-            length = np.hypot(normal_east, normal_north)
-            alignment = (
-                (normal_east * wind_east + normal_north * wind_north) / length
-                if length else 0.0
-            )
+    normal_index = 0
+    for ring in rings:
+        for east, north in ring:
+            normal_east, normal_north = normals[normal_index]
+            normal_index += 1
+            alignment = normal_east * wind_east + normal_north * wind_north
             alignments.append(float(np.clip(alignment, -1.0, 1.0)))
             local_window = box(
                 east - DENSITY_HALF_WINDOW_METERS,
@@ -194,6 +212,117 @@ def _live_geometry_features(
             active_pixels = geometry.intersection(local_window).area / NDWS_PIXEL_METERS**2
             densities.append(float(np.clip(active_pixels - 1.0, 0.0, 48.0)))
     return np.asarray(alignments), np.asarray(densities)
+
+
+def _smooth_ring_distances(
+    distances: np.ndarray, rings: list[list[tuple[float, float]]],
+) -> np.ndarray:
+    """Taper isolated spread/no-spread jumps without changing the maximum reach."""
+    smoothed = np.asarray(distances, dtype=float).copy()
+    offset = 0
+    for ring in rings:
+        values = smoothed[offset:offset + len(ring)].copy()
+        offset += len(ring)
+        if not np.any(values > 0.0):
+            continue
+        filtered = (
+            np.roll(values, 2) + 4.0 * np.roll(values, 1)
+            + 6.0 * values + 4.0 * np.roll(values, -1) + np.roll(values, -2)
+        ) / 16.0
+        if filtered.max() > 0.0:
+            filtered *= values.max() / filtered.max()
+        smoothed[offset - len(ring):offset] = filtered
+    return smoothed
+
+
+def _spread_directions(normals: np.ndarray, heading_degrees: float) -> np.ndarray:
+    """Bias local outward normals along the Rothermel wind/terrain heading."""
+    heading = np.asarray([
+        sin(radians(heading_degrees)), cos(radians(heading_degrees))
+    ])
+    projection = (normals @ heading)[:, None] * normals
+    tangential_heading = heading - projection
+    directions = normals + PHYSICS_TANGENT_BIAS * tangential_heading
+    lengths = np.linalg.norm(directions, axis=1)
+    zero = lengths == 0.0
+    directions[~zero] /= lengths[~zero, None]
+    directions[zero] = heading
+    return directions
+
+
+def _polygonal_only(geometry: Any) -> Polygon | MultiPolygon:
+    """Discard line/point artifacts that make_valid may return."""
+    polygons: list[Polygon] = []
+
+    def collect(item: Any) -> None:
+        if isinstance(item, Polygon):
+            if not item.is_empty and item.area > 0.0:
+                polygons.append(item)
+        elif isinstance(item, MultiPolygon):
+            polygons.extend(part for part in item.geoms if not part.is_empty)
+        elif hasattr(item, "geoms"):
+            for part in item.geoms:
+                collect(part)
+
+    collect(geometry)
+    if not polygons:
+        raise ValueError("predicted spread did not produce polygonal geometry")
+    result = unary_union(polygons)
+    if result.geom_type not in {"Polygon", "MultiPolygon"}:
+        raise ValueError("predicted spread did not produce a Polygon or MultiPolygon")
+    return result
+
+
+def _build_swept_prediction(
+    geometry: Polygon | MultiPolygon,
+    rings: list[list[tuple[float, float]]],
+    holes: list[bool],
+    distances: np.ndarray,
+    heading_degrees: float,
+) -> Polygon | MultiPolygon:
+    """Union edge-by-edge outward sweeps with the known current fire area."""
+    if len(distances) != sum(len(ring) for ring in rings):
+        raise ValueError("spread distances do not match boundary vertices")
+    if not np.any(distances > 0.0):
+        return geometry
+
+    normals = _ring_outward_normals(rings, holes)
+    directions = _spread_directions(normals, heading_degrees)
+    tapered = _smooth_ring_distances(distances, rings)
+    coordinates = np.asarray([point for ring in rings for point in ring], dtype=float)
+    moved = coordinates + directions * tapered[:, None]
+
+    swept_parts: list[Polygon] = []
+    offset = 0
+    for ring in rings:
+        count = len(ring)
+        for index in range(count):
+            following = (index + 1) % count
+            start, end = offset + index, offset + following
+            if tapered[start] <= 0.0 and tapered[end] <= 0.0:
+                continue
+            sweep = Polygon([
+                coordinates[start], coordinates[end], moved[end], moved[start]
+            ])
+            if not sweep.is_empty and sweep.area > 0.0:
+                valid_sweep = sweep if sweep.is_valid else _polygonal_only(make_valid(sweep))
+                swept_parts.extend(
+                    valid_sweep.geoms
+                    if isinstance(valid_sweep, MultiPolygon)
+                    else [valid_sweep]
+                )
+        offset += count
+
+    predicted = _polygonal_only(make_valid(unary_union([geometry, *swept_parts])))
+    predicted = _polygonal_only(make_valid(predicted.union(geometry)))
+    max_distance = float(tapered.max())
+    if not predicted.is_valid or not np.isfinite(predicted.bounds).all():
+        raise ValueError("predicted spread geometry is invalid")
+    if not predicted.buffer(1e-6).covers(geometry):
+        raise ValueError("predicted spread does not contain the current fire")
+    if not geometry.buffer(max_distance + MAX_SEGMENT_LENGTH_METERS).covers(predicted):
+        raise ValueError("predicted spread exceeds the allowed displacement")
+    return predicted
 
 
 def _rebuild_geometry(
@@ -324,21 +453,13 @@ class PredictionService:
             residuals[spreading] = self.regressor.predict(rows.loc[spreading])
         distances = np.where(spreading, np.clip(baseline + residuals, 0, MAX_SPREAD_METERS), 0)
 
-        east = np.sin(np.deg2rad(physics.heading_degrees)) * distances
-        north = np.cos(np.deg2rad(physics.heading_degrees)) * distances
-        translated_points = MultiPoint(
-            [
-                (x[index] + east[index], y[index] + north[index])
-                for index in np.flatnonzero(spreading)
-            ]
+        predicted_metric = _build_swept_prediction(
+            metric_geometry,
+            metric_rings,
+            _ring_hole_flags(metric_geometry),
+            distances,
+            physics.heading_degrees,
         )
-        if translated_points.is_empty:
-            predicted_metric = metric_geometry
-        else:
-            growth_envelope = unary_union(
-                [metric_geometry.boundary, translated_points]
-            ).convex_hull
-            predicted_metric = metric_geometry.union(growth_envelope)
         predicted = transform(inverse.transform, predicted_metric)
 
         return {
@@ -356,6 +477,7 @@ class PredictionService:
                 "physics_heading_degrees": physics.heading_degrees,
                 "physics_baseline_distance_m": baseline, "utm_epsg": metric_crs.to_epsg(),
                 "terrain_slope": slope,
+                "geometry_method": "outward_normals_with_edge_sweeps",
                 "neighboring_fire_pixels_proxy": "local polygon area in a 7 km window",
                 "weather": {
                     "temperature_c": weather.temperature_c,

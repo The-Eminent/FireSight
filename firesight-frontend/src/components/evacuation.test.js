@@ -4,6 +4,8 @@ import {
   HOME_LOCATION_STORAGE_KEY,
   intersectingBoundaryKeys,
   loadSavedHomeLocation,
+  notificationButtonLabel,
+  notificationPermissionAction,
   proximityAlert,
   saveHomeLocation,
   safetyCircle
@@ -12,6 +14,19 @@ import {
 const home = { lng: 0, lat: 0 };
 const nearby = polygon([[[-0.02, -0.02], [0.02, -0.02], [0.02, 0.02], [-0.02, 0.02], [-0.02, -0.02]]]);
 const distant = polygon([[[2, 2], [2.1, 2], [2.1, 2.1], [2, 2.1], [2, 2]]]);
+
+test('uses simple desktop-notification permission labels', () => {
+  expect(notificationButtonLabel('default')).toBe('Get Desktop Notifications');
+  expect(notificationButtonLabel('denied')).toBe('Get Desktop Notifications');
+  expect(notificationButtonLabel('granted')).toBe('Desktop Notifications Allowed');
+  expect(notificationButtonLabel('unsupported')).toBe('Desktop Notifications Unavailable');
+});
+
+test('requests undecided notification permission and explains a browser block', () => {
+  expect(notificationPermissionAction('default')).toBe('request');
+  expect(notificationPermissionAction('denied')).toBe('help');
+  expect(notificationPermissionAction('granted')).toBe('none');
+});
 
 test('creates a ten-mile polygon around the home location', () => {
   const radius = safetyCircle(home);

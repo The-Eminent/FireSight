@@ -7,7 +7,7 @@ export const EVENT_TYPE_OPTIONS = [
   { value: 'unverified_thermal_anomaly', label: 'Unverified thermal anomaly', color: '#f6c344' },
   {
     value: 'reported_incident_no_recent_satellite_detection',
-    label: 'Official report — no recent satellite detection',
+    label: 'Official report - no recent satellite detection',
     color: '#2c7bb6'
   }
 ];

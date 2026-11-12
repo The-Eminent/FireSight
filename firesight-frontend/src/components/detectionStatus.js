@@ -2,7 +2,7 @@ const labels = {
   confirmed_wildfire: 'Confirmed wildfire',
   satellite_detected_active_fire: 'Satellite-detected active fire',
   unverified_thermal_anomaly: 'Unverified thermal anomaly',
-  reported_incident_no_recent_satellite_detection: 'Reported incident — no recent satellite detection'
+  reported_incident_no_recent_satellite_detection: 'Reported incident - no recent satellite detection'
 };
 
 export function detectionStatusLabel(status) {
